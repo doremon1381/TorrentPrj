@@ -17,10 +17,25 @@ namespace TorrentProject.Services;
 /// </summary>
 public sealed class TorrentService : ITorrentService, IDisposable
 {
+    #region Constants
+
+    /// <summary>
+    /// Polling interval for download progress checks.
+    /// </summary>
+    private static readonly TimeSpan ProgressPollInterval = TimeSpan.FromSeconds(3);
+
+    #endregion
+
+    #region Fields
+
     private readonly ILogger<TorrentService> _logger;
     private readonly AppTorrentSettings _settings;
     private ClientEngine? _engine;
     private TorrentManager? _manager;
+
+    #endregion
+
+    #region Constructor
 
     public TorrentService(
         IOptions<AppTorrentSettings> settings,
@@ -30,78 +45,29 @@ public sealed class TorrentService : ITorrentService, IDisposable
         _logger = logger;
     }
 
+    #endregion
+
+    #region Public Methods
+
     /// <inheritdoc />
     public async Task<TorrentMetadata> LoadTorrentAsync(
         string torrentPathOrMagnet, CancellationToken ct = default)
     {
-        // Build engine settings
-        var engineSettings = new EngineSettingsBuilder
-        {
-            AllowPortForwarding = _settings.AllowPortForwarding,
-            AutoSaveLoadDhtCache = _settings.AutoSaveLoadDhtCache,
-            AutoSaveLoadFastResume = _settings.AutoSaveLoadFastResume,
-            AutoSaveLoadMagnetLinkMetadata = true,
-            ListenEndPoints = new Dictionary<string, IPEndPoint>
-            {
-                { "ipv4", new IPEndPoint(IPAddress.Any, 0) },
-                { "ipv6", new IPEndPoint(IPAddress.IPv6Any, 0) }
-            },
-            DhtEndPoint = new IPEndPoint(IPAddress.Any, 0)
-        };
+        _engine = CreateEngine();
 
-        _engine = new ClientEngine(engineSettings.ToSettings());
-
-        // Resolve absolute download directory
         var downloadDir = Path.GetFullPath(_settings.TempDownloadPath);
         Directory.CreateDirectory(downloadDir);
 
-        var torrentSettings = new TorrentSettingsBuilder
-        {
-            MaximumConnections = _settings.MaxConnections
-        };
+        _manager = await AddTorrentToEngineAsync(torrentPathOrMagnet, downloadDir);
 
-        // Load torrent or magnet
-        if (MagnetLink.TryParse(torrentPathOrMagnet, out var magnetLink))
-        {
-            _logger.LogInformation("Loading magnet link: {Magnet}", torrentPathOrMagnet[..Math.Min(80, torrentPathOrMagnet.Length)]);
-            _manager = await _engine.AddAsync(magnetLink, downloadDir, torrentSettings.ToSettings());
-        }
-        else
-        {
-            _logger.LogInformation("Loading torrent file: {Path}", torrentPathOrMagnet);
-            _manager = await _engine.AddAsync(torrentPathOrMagnet, downloadDir, torrentSettings.ToSettings());
-        }
+        AttachManagerEventHandlers();
 
-        // Hook state change events
-        _manager.TorrentStateChanged += (_, e) =>
-            _logger.LogInformation("Torrent state: {Old} → {New}", e.OldState, e.NewState);
-
-        _manager.PeersFound += (_, e) =>
-            _logger.LogDebug("{Type}: {NewPeers} new peers", e.GetType().Name, e.NewPeers);
-
-        // For magnet links, we need to start and wait for metadata
         if (_manager.HasMetadata is false)
         {
-            _logger.LogInformation("Waiting for magnet metadata...");
-            await _manager.StartAsync();
-            await _manager.WaitForMetadataAsync(ct);
-            await _manager.StopAsync();
-            _logger.LogInformation("Metadata received: {Name}", _manager.Torrent!.Name);
+            await WaitForMagnetMetadataAsync(ct);
         }
 
-        // Build file list
-        var files = _manager.Files
-            .Select((f, i) => new TorrentFileInfo(
-                Index: i,
-                Path: f.Path,
-                Size: f.Length,
-                FullPath: f.FullPath))
-            .ToList();
-
-        var metadata = new TorrentMetadata(
-            Name: _manager.Torrent?.Name ?? "Unknown",
-            Files: files,
-            TotalSize: _manager.Files.Sum(f => f.Length));
+        var metadata = BuildMetadata();
 
         _logger.LogInformation(
             "Torrent loaded: {Name} | {FileCount} files | {TotalSize:F2} MB",
@@ -115,46 +81,17 @@ public sealed class TorrentService : ITorrentService, IDisposable
         int fileIndex, string downloadDirectory,
         IProgress<double>? progress = null, CancellationToken ct = default)
     {
-        if (_manager is null || _engine is null)
-            throw new InvalidOperationException("Torrent not loaded. Call LoadTorrentAsync first.");
+        EnsureLoaded();
 
-        var targetFile = _manager.Files[fileIndex];
+        var targetFile = _manager!.Files[fileIndex];
         _logger.LogInformation(
             "Downloading file [{Index}/{Total}]: {Path} ({Size:F2} MB)",
             fileIndex + 1, _manager.Files.Count, targetFile.Path,
             targetFile.Length / 1024.0 / 1024.0);
 
-        // Set file priorities: current = HIGH, others = DO_NOT_DOWNLOAD
-        foreach (var file in _manager.Files)
-        {
-            await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
-        }
-        await _manager.SetFilePriorityAsync(targetFile, Priority.High);
-
-        // Start downloading
+        await SetSingleFilePriorityAsync(fileIndex);
         await _manager.StartAsync();
-
-        // Poll until this file is complete
-        while (targetFile.BitField.PercentComplete < 100.0)
-        {
-            ct.ThrowIfCancellationRequested();
-
-            var fileProgress = targetFile.BitField.PercentComplete;
-            progress?.Report(fileProgress);
-
-            var downSpeed = _engine.TotalDownloadRate / 1024.0;
-            var peers = await _manager.GetPeersAsync();
-
-            _logger.LogInformation(
-                "  Progress: {Progress:F1}% | Speed: {Speed:F1} KB/s | Peers: {Peers}",
-                fileProgress, downSpeed, peers.Count);
-
-            await Task.Delay(TimeSpan.FromSeconds(3), ct);
-        }
-
-        progress?.Report(100.0);
-
-        // Pause the manager (don't full-stop, so we can download next file)
+        await PollFileCompletionAsync(targetFile, progress, ct);
         await _manager.StopAsync();
 
         _logger.LogInformation("Download complete: {Path}", targetFile.FullPath);
@@ -165,146 +102,12 @@ public sealed class TorrentService : ITorrentService, IDisposable
     public ChannelReader<CompletedFileEvent> DownloadFilesConcurrentlyAsync(
         int maxConcurrent, CancellationToken ct = default)
     {
-        if (_manager is null || _engine is null)
-            throw new InvalidOperationException("Torrent not loaded. Call LoadTorrentAsync first.");
+        EnsureLoaded();
 
         var channel = Channel.CreateUnbounded<CompletedFileEvent>();
-
-        // Fire-and-forget the download loop — it writes to the channel
         _ = RunConcurrentDownloadsAsync(maxConcurrent, channel.Writer, ct);
 
         return channel.Reader;
-    }
-
-    /// <summary>
-    /// Core concurrent download loop. Sets up to N files to HIGH priority,
-    /// polls progress, and writes completed files to the channel.
-    /// </summary>
-    private async Task RunConcurrentDownloadsAsync(
-        int maxConcurrent, ChannelWriter<CompletedFileEvent> writer, CancellationToken ct)
-    {
-        try
-        {
-            var fileCount = _manager!.Files.Count;
-            var effectiveConcurrent = Math.Min(maxConcurrent, fileCount);
-
-            _logger.LogInformation(
-                "Starting concurrent download: {Concurrent} slots for {Total} files",
-                effectiveConcurrent, fileCount);
-
-            // Set all files to DoNotDownload initially
-            foreach (var file in _manager.Files)
-            {
-                await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
-            }
-
-            // Track active downloads and the file queue
-            var fileQueue = new Queue<int>(Enumerable.Range(0, fileCount));
-            var activeFiles = new Dictionary<int, Stopwatch>(); // fileIndex → stopwatch
-
-            // Fill initial batch
-            while (activeFiles.Count < effectiveConcurrent && fileQueue.Count > 0)
-            {
-                var idx = fileQueue.Dequeue();
-                await ActivateFileAsync(idx, activeFiles);
-            }
-
-            // Start the manager
-            await _manager.StartAsync();
-
-            // Poll loop
-            while (activeFiles.Count > 0)
-            {
-                ct.ThrowIfCancellationRequested();
-
-                // Check for completed files
-                var completedIndices = new List<int>();
-                foreach (var (idx, sw) in activeFiles)
-                {
-                    if (_manager.Files[idx].BitField.PercentComplete >= 100.0)
-                    {
-                        completedIndices.Add(idx);
-                    }
-                }
-
-                // Process completed files
-                foreach (var idx in completedIndices)
-                {
-                    var sw = activeFiles[idx];
-                    sw.Stop();
-
-                    var file = _manager.Files[idx];
-                    await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
-
-                    _logger.LogInformation(
-                        "✓ Download complete [{Index}/{Total}]: {Path} in {Time:F1}s",
-                        idx + 1, fileCount, file.Path, sw.Elapsed.TotalSeconds);
-
-                    // Write to channel for upload processing
-                    await writer.WriteAsync(new CompletedFileEvent(
-                        FileIndex: idx,
-                        LocalPath: file.FullPath,
-                        DownloadTime: sw.Elapsed), ct);
-
-                    activeFiles.Remove(idx);
-
-                    // Activate next file from queue
-                    if (fileQueue.Count > 0)
-                    {
-                        var nextIdx = fileQueue.Dequeue();
-                        await ActivateFileAsync(nextIdx, activeFiles);
-                    }
-                }
-
-                // Log progress for active files
-                if (activeFiles.Count > 0)
-                {
-                    var downSpeed = _engine!.TotalDownloadRate / 1024.0 / 1024.0;
-                    var peers = await _manager.GetPeersAsync();
-
-                    foreach (var (idx, _) in activeFiles)
-                    {
-                        var file = _manager.Files[idx];
-                        var pct = file.BitField.PercentComplete;
-                        _logger.LogInformation(
-                            "  [{Index}] {Name}: {Progress:F1}%",
-                            idx + 1, Path.GetFileName(file.Path), pct);
-                    }
-
-                    _logger.LogInformation(
-                        "  ↓ {Speed:F2} MB/s | Peers: {Peers} | Active: {Active} | Remaining: {Queue}",
-                        downSpeed, peers.Count, activeFiles.Count, fileQueue.Count);
-                }
-
-                await Task.Delay(TimeSpan.FromSeconds(3), ct);
-            }
-
-            // Stop the manager after all files are done
-            await _manager.StopAsync();
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger.LogError(ex, "Error during concurrent downloads");
-        }
-        finally
-        {
-            writer.Complete();
-        }
-    }
-
-    /// <summary>
-    /// Activate a file for download: set priority to HIGH and start tracking.
-    /// </summary>
-    private async Task ActivateFileAsync(int fileIndex, Dictionary<int, Stopwatch> activeFiles)
-    {
-        var file = _manager!.Files[fileIndex];
-        await _manager.SetFilePriorityAsync(file, Priority.High);
-        activeFiles[fileIndex] = Stopwatch.StartNew();
-
-        _logger.LogInformation(
-            "→ Queued for download [{Index}/{Total}]: {Path} ({Size:F2} MB)",
-            fileIndex + 1, _manager.Files.Count, file.Path,
-            file.Length / 1024.0 / 1024.0);
     }
 
     /// <inheritdoc />
@@ -327,8 +130,321 @@ public sealed class TorrentService : ITorrentService, IDisposable
         }
     }
 
+    /// <inheritdoc />
     public void Dispose()
     {
         _engine?.Dispose();
     }
+
+    #endregion
+
+    #region Private Methods — Engine Setup
+
+    /// <summary>
+    /// Create and configure the MonoTorrent client engine.
+    /// </summary>
+    private ClientEngine CreateEngine()
+    {
+        var engineSettings = new EngineSettingsBuilder
+        {
+            AllowPortForwarding = _settings.AllowPortForwarding,
+            AutoSaveLoadDhtCache = _settings.AutoSaveLoadDhtCache,
+            AutoSaveLoadFastResume = _settings.AutoSaveLoadFastResume,
+            AutoSaveLoadMagnetLinkMetadata = true,
+            ListenEndPoints = new Dictionary<string, IPEndPoint>
+            {
+                { "ipv4", new IPEndPoint(IPAddress.Any, 0) },
+                { "ipv6", new IPEndPoint(IPAddress.IPv6Any, 0) }
+            },
+            DhtEndPoint = new IPEndPoint(IPAddress.Any, 0)
+        };
+
+        return new ClientEngine(engineSettings.ToSettings());
+    }
+
+    /// <summary>
+    /// Add a torrent or magnet link to the engine and return its manager.
+    /// </summary>
+    private async Task<TorrentManager> AddTorrentToEngineAsync(
+        string torrentPathOrMagnet, string downloadDir)
+    {
+        var torrentSettings = new TorrentSettingsBuilder
+        {
+            MaximumConnections = _settings.MaxConnections
+        };
+
+        if (MagnetLink.TryParse(torrentPathOrMagnet, out var magnetLink))
+        {
+            _logger.LogInformation("Loading magnet link: {Magnet}",
+                torrentPathOrMagnet[..Math.Min(80, torrentPathOrMagnet.Length)]);
+            return await _engine!.AddAsync(magnetLink, downloadDir, torrentSettings.ToSettings());
+        }
+
+        _logger.LogInformation("Loading torrent file: {Path}", torrentPathOrMagnet);
+        return await _engine!.AddAsync(torrentPathOrMagnet, downloadDir, torrentSettings.ToSettings());
+    }
+
+    /// <summary>
+    /// Attach logging handlers for state changes and peer discovery.
+    /// </summary>
+    private void AttachManagerEventHandlers()
+    {
+        _manager!.TorrentStateChanged += (_, e) =>
+            _logger.LogInformation("Torrent state: {Old} → {New}", e.OldState, e.NewState);
+
+        _manager.PeersFound += (_, e) =>
+            _logger.LogDebug("{Type}: {NewPeers} new peers", e.GetType().Name, e.NewPeers);
+    }
+
+    /// <summary>
+    /// Start the manager, wait for magnet metadata, then stop.
+    /// </summary>
+    private async Task WaitForMagnetMetadataAsync(CancellationToken ct)
+    {
+        _logger.LogInformation("Waiting for magnet metadata...");
+        await _manager!.StartAsync();
+        await _manager.WaitForMetadataAsync(ct);
+        await _manager.StopAsync();
+        _logger.LogInformation("Metadata received: {Name}", _manager.Torrent!.Name);
+    }
+
+    /// <summary>
+    /// Build metadata from the loaded torrent's file list.
+    /// </summary>
+    private TorrentMetadata BuildMetadata()
+    {
+        var files = _manager!.Files
+            .Select((f, i) => new TorrentFileInfo(
+                Index: i,
+                Path: f.Path,
+                Size: f.Length,
+                FullPath: f.FullPath))
+            .ToList();
+
+        return new TorrentMetadata(
+            Name: _manager.Torrent?.Name ?? "Unknown",
+            Files: files,
+            TotalSize: _manager.Files.Sum(f => f.Length));
+    }
+
+    #endregion
+
+    #region Private Methods — Single-File Download
+
+    /// <summary>
+    /// Throw if the torrent has not been loaded yet.
+    /// </summary>
+    private void EnsureLoaded()
+    {
+        if (_manager is null || _engine is null)
+            throw new InvalidOperationException("Torrent not loaded. Call LoadTorrentAsync first.");
+    }
+
+    /// <summary>
+    /// Set one file to HIGH priority and all others to DoNotDownload.
+    /// </summary>
+    private async Task SetSingleFilePriorityAsync(int fileIndex)
+    {
+        foreach (var file in _manager!.Files)
+        {
+            await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
+        }
+        await _manager.SetFilePriorityAsync(_manager.Files[fileIndex], Priority.High);
+    }
+
+    /// <summary>
+    /// Poll a single file until it reaches 100% completion.
+    /// </summary>
+    private async Task PollFileCompletionAsync(
+        ITorrentManagerFile targetFile, IProgress<double>? progress, CancellationToken ct)
+    {
+        while (targetFile.BitField.PercentComplete < 100.0)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            progress?.Report(targetFile.BitField.PercentComplete);
+
+            var downSpeed = _engine!.TotalDownloadRate / 1024.0;
+            var peers = await _manager!.GetPeersAsync();
+
+            _logger.LogInformation(
+                "  Progress: {Progress:F1}% | Speed: {Speed:F1} KB/s | Peers: {Peers}",
+                targetFile.BitField.PercentComplete, downSpeed, peers.Count);
+
+            await Task.Delay(ProgressPollInterval, ct);
+        }
+
+        progress?.Report(100.0);
+    }
+
+    #endregion
+
+    #region Private Methods — Concurrent Download
+
+    /// <summary>
+    /// Core concurrent download loop. Sets up to N files to HIGH priority,
+    /// polls progress, and writes completed files to the channel.
+    /// </summary>
+    private async Task RunConcurrentDownloadsAsync(
+        int maxConcurrent, ChannelWriter<CompletedFileEvent> writer, CancellationToken ct)
+    {
+        try
+        {
+            var fileCount = _manager!.Files.Count;
+            var effectiveConcurrent = Math.Min(maxConcurrent, fileCount);
+
+            _logger.LogInformation(
+                "Starting concurrent download: {Concurrent} slots for {Total} files",
+                effectiveConcurrent, fileCount);
+
+            await SetAllFilesDoNotDownloadAsync();
+
+            var fileQueue = new Queue<int>(Enumerable.Range(0, fileCount));
+            var activeFiles = new Dictionary<int, Stopwatch>();
+
+            FillInitialBatch(fileQueue, activeFiles, effectiveConcurrent);
+            await _manager.StartAsync();
+
+            await PollConcurrentDownloadsAsync(fileQueue, activeFiles, fileCount, writer, ct);
+            await _manager.StopAsync();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Error during concurrent downloads");
+        }
+        finally
+        {
+            writer.Complete();
+        }
+    }
+
+    /// <summary>
+    /// Set all files to DoNotDownload priority.
+    /// </summary>
+    private async Task SetAllFilesDoNotDownloadAsync()
+    {
+        foreach (var file in _manager!.Files)
+        {
+            await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
+        }
+    }
+
+    /// <summary>
+    /// Fill the initial batch of active downloads from the queue.
+    /// </summary>
+    private void FillInitialBatch(
+        Queue<int> fileQueue, Dictionary<int, Stopwatch> activeFiles, int maxSlots)
+    {
+        while (activeFiles.Count < maxSlots && fileQueue.Count > 0)
+        {
+            var idx = fileQueue.Dequeue();
+            ActivateFile(idx, activeFiles);
+        }
+    }
+
+    /// <summary>
+    /// Poll all active files, process completions, and refill slots from the queue.
+    /// </summary>
+    private async Task PollConcurrentDownloadsAsync(
+        Queue<int> fileQueue, Dictionary<int, Stopwatch> activeFiles,
+        int totalFiles, ChannelWriter<CompletedFileEvent> writer, CancellationToken ct)
+    {
+        while (activeFiles.Count > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var completedIndices = FindCompletedFiles(activeFiles);
+
+            foreach (var idx in completedIndices)
+            {
+                await ProcessCompletedDownloadAsync(idx, activeFiles, totalFiles, writer, ct);
+
+                if (fileQueue.Count > 0)
+                {
+                    ActivateFile(fileQueue.Dequeue(), activeFiles);
+                }
+            }
+
+            if (activeFiles.Count > 0)
+            {
+                LogConcurrentProgress(activeFiles);
+            }
+
+            await Task.Delay(ProgressPollInterval, ct);
+        }
+    }
+
+    /// <summary>
+    /// Find file indices that have reached 100% completion.
+    /// </summary>
+    private List<int> FindCompletedFiles(Dictionary<int, Stopwatch> activeFiles)
+    {
+        return activeFiles
+            .Where(kv => _manager!.Files[kv.Key].BitField.PercentComplete >= 100.0)
+            .Select(kv => kv.Key)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Handle a completed file: stop tracking, set DoNotDownload, write to channel.
+    /// </summary>
+    private async Task ProcessCompletedDownloadAsync(
+        int fileIndex, Dictionary<int, Stopwatch> activeFiles,
+        int totalFiles, ChannelWriter<CompletedFileEvent> writer, CancellationToken ct)
+    {
+        var sw = activeFiles[fileIndex];
+        sw.Stop();
+
+        var file = _manager!.Files[fileIndex];
+        await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
+
+        _logger.LogInformation(
+            "✓ Download complete [{Index}/{Total}]: {Path} in {Time:F1}s",
+            fileIndex + 1, totalFiles, file.Path, sw.Elapsed.TotalSeconds);
+
+        await writer.WriteAsync(new CompletedFileEvent(
+            FileIndex: fileIndex,
+            LocalPath: file.FullPath,
+            DownloadTime: sw.Elapsed), ct);
+
+        activeFiles.Remove(fileIndex);
+    }
+
+    /// <summary>
+    /// Activate a file for download: set priority to HIGH and start tracking.
+    /// </summary>
+    private void ActivateFile(int fileIndex, Dictionary<int, Stopwatch> activeFiles)
+    {
+        var file = _manager!.Files[fileIndex];
+        _manager.SetFilePriorityAsync(file, Priority.High).GetAwaiter().GetResult();
+        activeFiles[fileIndex] = Stopwatch.StartNew();
+
+        _logger.LogInformation(
+            "→ Queued for download [{Index}/{Total}]: {Path} ({Size:F2} MB)",
+            fileIndex + 1, _manager.Files.Count, file.Path,
+            file.Length / 1024.0 / 1024.0);
+    }
+
+    /// <summary>
+    /// Log progress for all currently active concurrent downloads.
+    /// </summary>
+    private async void LogConcurrentProgress(Dictionary<int, Stopwatch> activeFiles)
+    {
+        var downSpeed = _engine!.TotalDownloadRate / 1024.0 / 1024.0;
+        var peers = await _manager!.GetPeersAsync();
+
+        foreach (var (idx, _) in activeFiles)
+        {
+            var file = _manager.Files[idx];
+            _logger.LogInformation(
+                "  [{Index}] {Name}: {Progress:F1}%",
+                idx + 1, Path.GetFileName(file.Path), file.BitField.PercentComplete);
+        }
+
+        _logger.LogInformation(
+            "  ↓ {Speed:F2} MB/s | Peers: {Peers} | Active: {Active}",
+            downSpeed, peers.Count, activeFiles.Count);
+    }
+
+    #endregion
 }

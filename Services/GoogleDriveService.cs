@@ -12,10 +12,25 @@ namespace TorrentProject.Services;
 /// </summary>
 public sealed class GoogleDriveService : IGoogleDriveService
 {
+    #region Constants
+
+    /// <summary>
+    /// Percentage interval for upload progress logging (every 10%).
+    /// </summary>
+    private const int LogIntervalPercent = 10;
+
+    #endregion
+
+    #region Fields
+
     private readonly ILogger<GoogleDriveService> _logger;
     private readonly GoogleDriveSettings _settings;
     private readonly GoogleAuthService _authService;
     private DriveService? _driveService;
+
+    #endregion
+
+    #region Constructor
 
     public GoogleDriveService(
         GoogleAuthService authService,
@@ -27,14 +42,9 @@ public sealed class GoogleDriveService : IGoogleDriveService
         _logger = logger;
     }
 
-    /// <summary>
-    /// Lazily authenticate and cache the DriveService instance.
-    /// </summary>
-    private async Task<DriveService> GetDriveServiceAsync(CancellationToken ct)
-    {
-        _driveService ??= await _authService.AuthenticateAsync(_settings, ct);
-        return _driveService;
-    }
+    #endregion
+
+    #region Public Methods
 
     /// <inheritdoc />
     public async Task<string> UploadFileAsync(
@@ -53,37 +63,10 @@ public sealed class GoogleDriveService : IGoogleDriveService
             fileName, fileSize / 1024.0 / 1024.0,
             string.IsNullOrEmpty(folderId) ? "(root)" : folderId);
 
-        var fileMetadata = new Google.Apis.Drive.v3.Data.File
-        {
-            Name = fileName,
-            Parents = !string.IsNullOrEmpty(folderId) ? [folderId] : null
-        };
+        var request = await CreateUploadRequestAsync(
+            driveService, localFilePath, fileName, folderId);
 
-        await using var stream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read);
-        var mimeType = GetMimeType(localFilePath);
-
-        var request = driveService.Files.Create(fileMetadata, stream, mimeType);
-        request.Fields = "id, name, size, webViewLink";
-        request.ChunkSize = _settings.ChunkSizeMB * 1024 * 1024;
-
-        var totalChunks = (int)Math.Ceiling((double)fileSize / request.ChunkSize);
-        var lastLoggedPercent = -1;
-
-        request.ProgressChanged += p =>
-        {
-            progress?.Report(p.BytesSent);
-
-            var percent = fileSize > 0 ? (int)(p.BytesSent * 100 / fileSize) : 0;
-
-            // Log every 10% to avoid spamming
-            if (percent / 10 > lastLoggedPercent / 10)
-            {
-                lastLoggedPercent = percent;
-                _logger.LogInformation(
-                    "  Upload: {Percent}% | {Sent:F1} / {Total:F1} MB",
-                    percent, p.BytesSent / 1024.0 / 1024.0, fileSize / 1024.0 / 1024.0);
-            }
-        };
+        AttachProgressHandler(request, fileSize, progress);
 
         var result = await request.UploadAsync(ct);
 
@@ -129,6 +112,65 @@ public sealed class GoogleDriveService : IGoogleDriveService
         return folder.Id;
     }
 
+    #endregion
+
+    #region Private Methods
+
+    /// <summary>
+    /// Lazily authenticate and cache the DriveService instance.
+    /// </summary>
+    private async Task<DriveService> GetDriveServiceAsync(CancellationToken ct)
+    {
+        _driveService ??= await _authService.AuthenticateAsync(_settings, ct);
+        return _driveService;
+    }
+
+    /// <summary>
+    /// Create a resumable upload request for a local file.
+    /// </summary>
+    private async Task<FilesResource.CreateMediaUpload> CreateUploadRequestAsync(
+        DriveService driveService, string localFilePath, string fileName, string? folderId)
+    {
+        var fileMetadata = new Google.Apis.Drive.v3.Data.File
+        {
+            Name = fileName,
+            Parents = !string.IsNullOrEmpty(folderId) ? [folderId] : null
+        };
+
+        var stream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read);
+        var mimeType = GetMimeType(localFilePath);
+
+        var request = driveService.Files.Create(fileMetadata, stream, mimeType);
+        request.Fields = "id, name, size, webViewLink";
+        request.ChunkSize = _settings.ChunkSizeMB * 1024 * 1024;
+
+        return request;
+    }
+
+    /// <summary>
+    /// Attach a progress handler that logs upload percentage at regular intervals.
+    /// </summary>
+    private void AttachProgressHandler(
+        FilesResource.CreateMediaUpload request, long fileSize, IProgress<long>? progress)
+    {
+        var lastLoggedPercent = -1;
+
+        request.ProgressChanged += p =>
+        {
+            progress?.Report(p.BytesSent);
+
+            var percent = fileSize > 0 ? (int)(p.BytesSent * 100 / fileSize) : 0;
+
+            if (percent / LogIntervalPercent > lastLoggedPercent / LogIntervalPercent)
+            {
+                lastLoggedPercent = percent;
+                _logger.LogInformation(
+                    "  Upload: {Percent}% | {Sent:F1} / {Total:F1} MB",
+                    percent, p.BytesSent / 1024.0 / 1024.0, fileSize / 1024.0 / 1024.0);
+            }
+        };
+    }
+
     /// <summary>
     /// Map file extension to MIME type for the Drive upload.
     /// </summary>
@@ -164,4 +206,6 @@ public sealed class GoogleDriveService : IGoogleDriveService
             _ => "application/octet-stream"
         };
     }
+
+    #endregion
 }

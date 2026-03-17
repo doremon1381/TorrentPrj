@@ -6,3 +6,4 @@ tokens/
 temp/
 publish/
 service-account.json.bak
+cache/

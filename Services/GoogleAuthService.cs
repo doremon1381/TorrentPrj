@@ -14,8 +14,14 @@ namespace TorrentProject.Services;
 /// </summary>
 public sealed class GoogleAuthService(ILogger<GoogleAuthService> logger)
 {
+    #region Constants
+
     private const string ApplicationName = "TorrentProject";
     private static readonly string[] Scopes = [DriveService.Scope.DriveFile];
+
+    #endregion
+
+    #region Public Methods
 
     /// <summary>
     /// Auto-detect auth method: Service Account key → OAuth2 → error.
@@ -43,33 +49,13 @@ public sealed class GoogleAuthService(ILogger<GoogleAuthService> logger)
     }
 
     /// <summary>
-    /// Authenticate using Service Account key (headless, no browser needed).
-    /// </summary>
-    private async Task<DriveService> AuthenticateWithServiceAccountAsync(
-        string keyPath, CancellationToken ct)
-    {
-        await using var stream = new FileStream(keyPath, FileMode.Open, FileAccess.Read);
-#pragma warning disable CS0618 // GoogleCredential.FromStream is deprecated but CredentialFactory replacement requires additional setup
-        var credential = GoogleCredential.FromStream(stream)
-            .CreateScoped(Scopes);
-#pragma warning restore CS0618
-
-        logger.LogInformation("Service Account authenticated successfully");
-
-        return new DriveService(new BaseClientService.Initializer
-        {
-            HttpClientInitializer = credential,
-            ApplicationName = ApplicationName
-        });
-    }
-
-    /// <summary>
     /// Authenticate using OAuth2 user credentials (opens browser on first run).
     /// </summary>
     public async Task<DriveService> AuthenticateWithOAuth2Async(
         string credentialsPath, string tokenStorePath, CancellationToken ct)
     {
         await using var stream = new FileStream(credentialsPath, FileMode.Open, FileAccess.Read);
+
         var credential = await GoogleWebAuthorizationBroker.AuthorizeAsync(
             (await GoogleClientSecrets.FromStreamAsync(stream, ct)).Secrets,
             Scopes, "user", ct,
@@ -77,10 +63,42 @@ public sealed class GoogleAuthService(ILogger<GoogleAuthService> logger)
 
         logger.LogInformation("OAuth2 authenticated successfully");
 
+        return CreateDriveService(credential);
+    }
+
+    #endregion
+
+    #region Private Methods
+
+    /// <summary>
+    /// Authenticate using Service Account key (headless, no browser needed).
+    /// </summary>
+    private async Task<DriveService> AuthenticateWithServiceAccountAsync(
+        string keyPath, CancellationToken ct)
+    {
+        await using var stream = new FileStream(keyPath, FileMode.Open, FileAccess.Read);
+
+#pragma warning disable CS0618 // GoogleCredential.FromStream is deprecated but CredentialFactory requires additional setup
+        var credential = GoogleCredential.FromStream(stream)
+            .CreateScoped(Scopes);
+#pragma warning restore CS0618
+
+        logger.LogInformation("Service Account authenticated successfully");
+
+        return CreateDriveService(credential);
+    }
+
+    /// <summary>
+    /// Create a DriveService instance with the given credential.
+    /// </summary>
+    private static DriveService CreateDriveService(object credential)
+    {
         return new DriveService(new BaseClientService.Initializer
         {
-            HttpClientInitializer = credential,
+            HttpClientInitializer = (Google.Apis.Http.IConfigurableHttpClientInitializer)credential,
             ApplicationName = ApplicationName
         });
     }
+
+    #endregion
 }

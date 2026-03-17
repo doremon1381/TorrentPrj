@@ -21,65 +21,27 @@ public sealed class TorrentWorker(
     ILogger<TorrentWorker> logger,
     IHostApplicationLifetime lifetime) : BackgroundService
 {
+    #region Public Methods
+
+    /// <inheritdoc />
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var results = new List<FileProcessResult>();
 
         try
         {
-            // 1. Load torrent metadata
-            logger.LogInformation("═══ TorrentProject – Starting ═══");
-            var metadata = await torrentService.LoadTorrentAsync(
-                downloadRequest.InputValue, stoppingToken);
+            var metadata = await LoadTorrentAsync(stoppingToken);
+            var torrentFolderId = await CreateDriveFolderAsync(metadata, stoppingToken);
+            var maxConcurrent = GetEffectiveConcurrency();
 
-            LogTorrentSummary(metadata);
+            logger.LogInformation("Download mode: {Concurrent} concurrent file(s)", maxConcurrent);
 
-            // 2. Create a Drive folder for this torrent (optional)
-            var targetFolderId = downloadRequest.DriveFolderId
-                ?? driveSettings.Value.TargetFolderId;
-
-            string? torrentFolderId = null;
-            if (!string.IsNullOrEmpty(targetFolderId))
-            {
-                torrentFolderId = await driveService.CreateFolderAsync(
-                    metadata.Name, targetFolderId, stoppingToken);
-                logger.LogInformation("Created Drive folder: {Name} → {Id}", metadata.Name, torrentFolderId);
-            }
-
-            // 3. Determine concurrency
-            var maxConcurrent = downloadRequest.MaxConcurrentFiles
-                ?? torrentSettings.Value.MaxConcurrentFiles;
-
-            logger.LogInformation(
-                "Download mode: {Concurrent} concurrent file(s)",
-                maxConcurrent);
-
-            // 4. Start concurrent downloads — reads completed files from channel
             var completedReader = torrentService.DownloadFilesConcurrentlyAsync(
                 maxConcurrent, stoppingToken);
 
-            // 5. Process each completed file: upload → delete
-            await foreach (var completed in completedReader.ReadAllAsync(stoppingToken))
-            {
-                stoppingToken.ThrowIfCancellationRequested();
+            await ProcessCompletedFilesAsync(
+                completedReader, metadata, torrentFolderId, results, stoppingToken);
 
-                var fileInfo = metadata.Files[completed.FileIndex];
-                logger.LogInformation(
-                    "═══ Uploading [{Index}/{Total}]: {Path} ═══",
-                    completed.FileIndex + 1, metadata.Files.Count, fileInfo.Path);
-
-                var result = await UploadAndCleanupAsync(
-                    completed, fileInfo, torrentFolderId, stoppingToken);
-
-                results.Add(result);
-
-                logger.LogInformation(
-                    "✓ Complete: {Name} | DL: {DlTime:F1}s | UL: {UlTime:F1}s | Drive: {DriveId}",
-                    result.FileName, result.DownloadTime.TotalSeconds,
-                    result.UploadTime.TotalSeconds, result.DriveFileId);
-            }
-
-            // 6. Summary
             LogFinalSummary(metadata, results);
         }
         catch (OperationCanceledException)
@@ -97,6 +59,85 @@ public sealed class TorrentWorker(
         }
     }
 
+    #endregion
+
+    #region Private Methods — Pipeline Stages
+
+    /// <summary>
+    /// Load the torrent metadata and log a summary of its contents.
+    /// </summary>
+    private async Task<TorrentMetadata> LoadTorrentAsync(CancellationToken ct)
+    {
+        logger.LogInformation("═══ TorrentProject – Starting ═══");
+
+        var metadata = await torrentService.LoadTorrentAsync(
+            downloadRequest.InputValue, ct);
+
+        LogTorrentSummary(metadata);
+        return metadata;
+    }
+
+    /// <summary>
+    /// Create a Drive folder for this torrent if a target folder ID is configured.
+    /// </summary>
+    private async Task<string?> CreateDriveFolderAsync(
+        TorrentMetadata metadata, CancellationToken ct)
+    {
+        var targetFolderId = downloadRequest.DriveFolderId
+            ?? driveSettings.Value.TargetFolderId;
+
+        if (string.IsNullOrEmpty(targetFolderId))
+            return null;
+
+        var torrentFolderId = await driveService.CreateFolderAsync(
+            metadata.Name, targetFolderId, ct);
+
+        logger.LogInformation("Created Drive folder: {Name} → {Id}", metadata.Name, torrentFolderId);
+        return torrentFolderId;
+    }
+
+    /// <summary>
+    /// Determine the effective concurrency from CLI override or appsettings default.
+    /// </summary>
+    private int GetEffectiveConcurrency()
+    {
+        return downloadRequest.MaxConcurrentFiles
+            ?? torrentSettings.Value.MaxConcurrentFiles;
+    }
+
+    /// <summary>
+    /// Read completed downloads from the channel, upload each, and delete local files.
+    /// </summary>
+    private async Task ProcessCompletedFilesAsync(
+        System.Threading.Channels.ChannelReader<CompletedFileEvent> completedReader,
+        TorrentMetadata metadata, string? torrentFolderId,
+        List<FileProcessResult> results, CancellationToken ct)
+    {
+        await foreach (var completed in completedReader.ReadAllAsync(ct))
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var fileInfo = metadata.Files[completed.FileIndex];
+            logger.LogInformation(
+                "═══ Uploading [{Index}/{Total}]: {Path} ═══",
+                completed.FileIndex + 1, metadata.Files.Count, fileInfo.Path);
+
+            var result = await UploadAndCleanupAsync(
+                completed, fileInfo, torrentFolderId, ct);
+
+            results.Add(result);
+
+            logger.LogInformation(
+                "✓ Complete: {Name} | DL: {DlTime:F1}s | UL: {UlTime:F1}s | Drive: {DriveId}",
+                result.FileName, result.DownloadTime.TotalSeconds,
+                result.UploadTime.TotalSeconds, result.DriveFileId);
+        }
+    }
+
+    #endregion
+
+    #region Private Methods — File Processing
+
     /// <summary>
     /// Upload a completed file to Drive and delete the local copy.
     /// </summary>
@@ -106,30 +147,14 @@ public sealed class TorrentWorker(
         string? targetFolderId,
         CancellationToken ct)
     {
-        // Upload
         var ulStopwatch = Stopwatch.StartNew();
-        var uploadProgress = new Progress<long>(_ => { });
 
         var driveFileId = await driveService.UploadFileAsync(
-            completed.LocalPath, targetFolderId, uploadProgress, ct);
+            completed.LocalPath, targetFolderId, ct: ct);
+
         ulStopwatch.Stop();
 
-        // Delete local file
-        try
-        {
-            if (File.Exists(completed.LocalPath))
-            {
-                var fileSize = new FileInfo(completed.LocalPath).Length;
-                File.Delete(completed.LocalPath);
-                logger.LogInformation(
-                    "Deleted temp file: {Path} ({Size:F2} MB freed)",
-                    completed.LocalPath, fileSize / 1024.0 / 1024.0);
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Failed to delete temp file: {Path}", completed.LocalPath);
-        }
+        DeleteLocalFile(completed.LocalPath);
 
         return new FileProcessResult(
             FileName: fileInfo.Path,
@@ -139,6 +164,34 @@ public sealed class TorrentWorker(
             UploadTime: ulStopwatch.Elapsed);
     }
 
+    /// <summary>
+    /// Safely delete a temporary local file after successful upload.
+    /// </summary>
+    private void DeleteLocalFile(string localPath)
+    {
+        try
+        {
+            if (!File.Exists(localPath)) return;
+
+            var fileSize = new FileInfo(localPath).Length;
+            File.Delete(localPath);
+            logger.LogInformation(
+                "Deleted temp file: {Path} ({Size:F2} MB freed)",
+                localPath, fileSize / 1024.0 / 1024.0);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to delete temp file: {Path}", localPath);
+        }
+    }
+
+    #endregion
+
+    #region Private Methods — Logging
+
+    /// <summary>
+    /// Log a summary of the torrent's file list.
+    /// </summary>
     private void LogTorrentSummary(TorrentMetadata metadata)
     {
         logger.LogInformation("Torrent: {Name}", metadata.Name);
@@ -158,6 +211,9 @@ public sealed class TorrentWorker(
         logger.LogInformation("─────────────────────────────────────────");
     }
 
+    /// <summary>
+    /// Log a final summary of all processed files.
+    /// </summary>
     private void LogFinalSummary(TorrentMetadata metadata, List<FileProcessResult> results)
     {
         logger.LogInformation("═══ TorrentProject – Complete ═══");
@@ -175,4 +231,6 @@ public sealed class TorrentWorker(
         logger.LogInformation("Wall time:      {Time} (downloads were concurrent)",
             TimeSpan.FromTicks(Math.Max(totalDlTime.Ticks, totalUlTime.Ticks)));
     }
+
+    #endregion
 }
