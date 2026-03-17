@@ -58,6 +58,7 @@ public record TorrentSettings
 // Configuration/GoogleDriveSettings.cs
 public record GoogleDriveSettings
 {
+    public string ServiceAccountKeyPath { get; init; } = "./service-account.json";
     public string CredentialsPath { get; init; } = "./credentials.json";
     public string TokenStorePath { get; init; } = "./tokens";
     public string TargetFolderId { get; init; } = "";

@@ -1,2 +1,7 @@
 bin/
 obj/
+service-account.json
+credentials.json
+tokens/
+temp/
+publish/

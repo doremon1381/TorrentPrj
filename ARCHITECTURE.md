@@ -280,6 +280,7 @@ Any unexpected exception?
     "AutoSaveLoadDhtCache": true
   },
   "GoogleDriveSettings": {
+    "ServiceAccountKeyPath": "./service-account.json",
     "CredentialsPath": "./credentials.json",
     "TokenStorePath": "./tokens",
     "TargetFolderId": "",
@@ -295,9 +296,10 @@ Any unexpected exception?
 | `AllowPortForwarding` | UPnP/NAT-PMP for better connectivity | `true` |
 | `AutoSaveLoadFastResume` | Skip re-hashing on restart | `true` |
 | `AutoSaveLoadDhtCache` | Faster peer discovery on restart | `true` |
-| `CredentialsPath` | Google OAuth2 client secret JSON | `./credentials.json` |
-| `TokenStorePath` | Cached refresh tokens | `./tokens` |
-| `TargetFolderId` | Drive folder to upload into (empty = root) | `""` |
+| `ServiceAccountKeyPath` | Google SA key file (primary, VPS) | `./service-account.json` |
+| `CredentialsPath` | Google OAuth2 client secret (fallback) | `./credentials.json` |
+| `TokenStorePath` | Cached OAuth2 refresh tokens | `./tokens` |
+| `TargetFolderId` | Drive folder to upload into (**required** for SA) | `""` |
 | `ChunkSizeMB` | Resumable upload chunk size (must be ≥ 8 MB) | `10` |
 
 ---
@@ -353,33 +355,40 @@ Program.cs
 
 ## Headless VPS Deployment
 
-### OAuth2 Token Flow (Headless)
+### Auth: Service Account (No Browser Needed)
 
 ```
-┌─────────────────────────────┐
-│    LOCAL MACHINE (browser)   │
-│                             │
-│  1. dotnet run -- auth      │
-│  2. Browser opens           │
-│  3. User grants consent     │
-│  4. Token saved to ./tokens │
-└──────────┬──────────────────┘
-           │ scp ./tokens/ ./credentials.json
-           ▼
-┌─────────────────────────────┐
-│    VPS (headless, no GUI)    │
-│                             │
-│  ./tokens/                  │
-│    └── Google.Apis.Auth...  │  ← Contains refresh token
-│  ./credentials.json         │  ← Client ID + secret
-│                             │
-│  Token auto-refreshes       │
-│  indefinitely via refresh   │
-│  token (no browser needed)  │
-└─────────────────────────────┘
+┌──────────────────────────────────────┐
+│  Google Cloud Console (one-time setup)    │
+│                                          │
+│  1. Create Service Account                │
+│  2. Download JSON key                     │
+│  3. Share Drive folder with SA email      │
+└──────────────────┬───────────────────┘
+                   │ scp service-account.json
+                   ▼
+┌──────────────────────────────────────┐
+│    VPS (headless, no GUI)                 │
+│                                          │
+│  ./service-account.json  ← SA key file    │
+│         │                                 │
+│         ▼                                 │
+│  GoogleCredential.FromStream()            │
+│         │                                 │
+│         ▼                                 │
+│  DriveService (authenticated)             │
+│         │                                 │
+│         ▼                                 │
+│  Upload to shared Drive folder            │
+│  (TargetFolderId in appsettings.json)     │
+│                                          │
+│  ✔ No browser. No token expiry.            │
+│  ✔ Works indefinitely.                     │
+└──────────────────────────────────────┘
 ```
 
-> **Important**: The refresh token does NOT expire unless you revoke it in Google Cloud Console or the app is unused for 6 months (for apps in "Testing" status). For production, publish the OAuth consent screen to avoid the 6-month expiry.
+> **Service Account vs OAuth2**: SA credentials use a private key, not tokens.
+> There is no refresh cycle — the key works until you delete it in Cloud Console.
 
 ### VPS Deployment Architecture
 
@@ -387,9 +396,7 @@ Program.cs
 /opt/torrentproject/
 ├── TorrentProject              # Self-contained Linux binary
 ├── appsettings.json            # Configuration
-├── credentials.json            # Google OAuth2 client secret
-├── tokens/                     # Cached OAuth2 refresh token
-│   └── Google.Apis.Auth...
+├── service-account.json        # Google SA key (never expires)
 └── temp/                       # Temporary download directory
     └── (files appear and disappear during processing)
 ```
@@ -431,6 +438,7 @@ WantedBy=multi-user.target
 ```bash
 # Deploy
 scp -r ./publish/* user@vps:/opt/torrentproject/
+scp ./service-account.json user@vps:/opt/torrentproject/
 ssh user@vps "chmod +x /opt/torrentproject/TorrentProject"
 
 # Run one-off download

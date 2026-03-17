@@ -38,7 +38,7 @@ A .NET 9 console application that **downloads torrent files and uploads them dir
 | Hosting              | `Microsoft.Extensions.Hosting` (Generic Host)|
 | Configuration        | `appsettings.json` + Options pattern         |
 | Logging              | `Microsoft.Extensions.Logging` (Console/File)|
-| Auth                 | OAuth2 User Credentials (Desktop App)        |
+| Auth                 | Service Account (VPS) / OAuth2 (local dev)   |
 
 ---
 
@@ -57,7 +57,7 @@ TorrentProject/
 ├── Services/
 │   ├── TorrentService.cs             # MonoTorrent download implementation
 │   ├── GoogleDriveService.cs         # Google Drive upload implementation
-│   └── GoogleAuthService.cs          # OAuth2 token lifecycle
+│   └── GoogleAuthService.cs          # Auth: Service Account or OAuth2
 ├── Workers/
 │   └── TorrentWorker.cs              # BackgroundService orchestrator
 ├── Models/
@@ -66,7 +66,8 @@ TorrentProject/
 │   └── TorrentFileInfo.cs            # Per-file metadata (name, size, priority)
 ├── Program.cs                        # Host setup, DI registration
 ├── appsettings.json                  # Runtime configuration
-├── credentials.json                  # Google OAuth2 client secret (git-ignored)
+├── service-account.json              # Google SA key (VPS, git-ignored)
+├── credentials.json                  # Google OAuth2 client secret (local dev, git-ignored)
 └── TorrentProject.csproj
 ```
 
@@ -108,6 +109,7 @@ TorrentProject/
     "AutoSaveLoadDhtCache": true
   },
   "GoogleDriveSettings": {
+    "ServiceAccountKeyPath": "./service-account.json",
     "CredentialsPath": "./credentials.json",
     "TokenStorePath": "./tokens",
     "TargetFolderId": "",
@@ -139,7 +141,7 @@ For each file in torrent (sorted by index):
 5. Report progress via logging (percentage, speed, peers)
 
 ### 2. Upload to Google Drive
-1. Authenticate via OAuth2 (headless: use `auth` command on a machine with browser first)
+1. Authenticate via Service Account (auto-detected if `service-account.json` exists)
 2. Create resumable upload session for the downloaded file
 3. Upload in chunks (configurable `ChunkSizeMB`)
 4. Return the Google Drive file ID on success
@@ -153,26 +155,29 @@ For each file in torrent (sorted by index):
 
 ## Google Drive Auth Setup (One-Time)
 
+### Method A: Service Account (Recommended for VPS)
+
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
 2. Create a project → Enable **Google Drive API**
-3. Create **OAuth 2.0 Client ID** → Application type: **Desktop App**
-4. Download the JSON → save as `credentials.json` in project root
-5. Add `credentials.json` and `tokens/` to `.gitignore`
+3. **IAM & Admin** → **Service Accounts** → Create Service Account
+4. Click the SA → **Keys** tab → **Add Key** → JSON → Download as `service-account.json`
+5. **Share your Google Drive folder** with the SA email (e.g., `torrent-uploader@proj.iam.gserviceaccount.com`) as **Editor**
+6. Set `TargetFolderId` in `appsettings.json` to that shared folder's ID
+7. No browser needed. No token expiry. Works indefinitely.
 
-### Headless VPS Auth (No Browser)
+### Method B: OAuth2 (Local Development Fallback)
 
-Since VPS has no GUI, authenticate on your **local machine first**, then copy the tokens:
+1. **Credentials** → Create **OAuth 2.0 Client ID** → Type: **Desktop App**
+2. Download JSON → save as `credentials.json` in project root
+3. Run `dotnet run -- auth` to authenticate (opens browser)
+4. **IMPORTANT**: Publish OAuth consent screen if using longer than 7 days
 
-```bash
-# Step 1: On your LOCAL machine (has browser)
-dotnet run -- auth
-# → Opens browser → Grant consent → Token saved to ./tokens/
+### Auto-Detection
 
-# Step 2: Copy tokens + credentials to VPS
-scp -r ./tokens/ ./credentials.json user@vps:/opt/torrentproject/
-
-# Step 3: On VPS, tokens are reused automatically (refresh token handles renewal)
-```
+The app auto-detects which method to use:
+- If `service-account.json` exists → use Service Account
+- Else if `credentials.json` exists → use OAuth2
+- Else → throw error
 
 ---
 
@@ -270,6 +275,7 @@ journalctl -u torrentproject -f
 ## .gitignore Essentials
 
 ```
+service-account.json
 credentials.json
 tokens/
 temp/
