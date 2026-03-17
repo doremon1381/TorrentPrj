@@ -5,3 +5,4 @@ credentials.json
 tokens/
 temp/
 publish/
+service-account.json.bak
