@@ -14,6 +14,9 @@ public sealed record DownloadRequest
     /// <summary>Optional Google Drive folder ID override (from --drive-folder).</summary>
     public string? DriveFolderId { get; init; }
 
+    /// <summary>Max concurrent file downloads override (from --concurrent). Null = use appsettings default.</summary>
+    public int? MaxConcurrentFiles { get; init; }
+
     /// <summary>Returns the torrent path or magnet URI, whichever was provided.</summary>
     public string InputValue => TorrentPath ?? Magnet
         ?? throw new InvalidOperationException("Either TorrentPath or Magnet must be set.");

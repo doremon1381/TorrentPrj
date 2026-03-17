@@ -9,8 +9,8 @@ using TorrentProject.Models;
 namespace TorrentProject.Workers;
 
 /// <summary>
-/// Background service that orchestrates the per-file pipeline:
-/// Load torrent → for each file: download → upload → delete → next → shutdown.
+/// Background service that orchestrates the concurrent download pipeline:
+/// Load torrent → download up to N files concurrently → upload each as it completes → delete → shutdown.
 /// </summary>
 public sealed class TorrentWorker(
     ITorrentService torrentService,
@@ -46,29 +46,40 @@ public sealed class TorrentWorker(
                 logger.LogInformation("Created Drive folder: {Name} → {Id}", metadata.Name, torrentFolderId);
             }
 
-            // 3. Per-file loop: download → upload → delete
-            for (var i = 0; i < metadata.Files.Count; i++)
+            // 3. Determine concurrency
+            var maxConcurrent = downloadRequest.MaxConcurrentFiles
+                ?? torrentSettings.Value.MaxConcurrentFiles;
+
+            logger.LogInformation(
+                "Download mode: {Concurrent} concurrent file(s)",
+                maxConcurrent);
+
+            // 4. Start concurrent downloads — reads completed files from channel
+            var completedReader = torrentService.DownloadFilesConcurrentlyAsync(
+                maxConcurrent, stoppingToken);
+
+            // 5. Process each completed file: upload → delete
+            await foreach (var completed in completedReader.ReadAllAsync(stoppingToken))
             {
                 stoppingToken.ThrowIfCancellationRequested();
 
-                var file = metadata.Files[i];
+                var fileInfo = metadata.Files[completed.FileIndex];
                 logger.LogInformation(
-                    "═══ Processing file [{Index}/{Total}]: {Path} ({Size:F2} MB) ═══",
-                    i + 1, metadata.Files.Count, file.Path,
-                    file.Size / 1024.0 / 1024.0);
+                    "═══ Uploading [{Index}/{Total}]: {Path} ═══",
+                    completed.FileIndex + 1, metadata.Files.Count, fileInfo.Path);
 
-                var result = await ProcessSingleFileAsync(
-                    i, file, torrentFolderId, stoppingToken);
+                var result = await UploadAndCleanupAsync(
+                    completed, fileInfo, torrentFolderId, stoppingToken);
 
                 results.Add(result);
 
                 logger.LogInformation(
-                    "✓ File complete: {Name} | Download: {DlTime:F1}s | Upload: {UlTime:F1}s | Drive ID: {DriveId}",
+                    "✓ Complete: {Name} | DL: {DlTime:F1}s | UL: {UlTime:F1}s | Drive: {DriveId}",
                     result.FileName, result.DownloadTime.TotalSeconds,
                     result.UploadTime.TotalSeconds, result.DriveFileId);
             }
 
-            // 4. Summary
+            // 6. Summary
             LogFinalSummary(metadata, results);
         }
         catch (OperationCanceledException)
@@ -87,60 +98,44 @@ public sealed class TorrentWorker(
     }
 
     /// <summary>
-    /// Process a single file: download → upload → delete local copy.
+    /// Upload a completed file to Drive and delete the local copy.
     /// </summary>
-    private async Task<FileProcessResult> ProcessSingleFileAsync(
-        int fileIndex,
-        Models.TorrentFileInfo fileInfo,
+    private async Task<FileProcessResult> UploadAndCleanupAsync(
+        CompletedFileEvent completed,
+        TorrentFileInfo fileInfo,
         string? targetFolderId,
         CancellationToken ct)
     {
-        var downloadDir = torrentSettings.Value.TempDownloadPath;
-
-        // Download
-        var dlStopwatch = Stopwatch.StartNew();
-        var downloadProgress = new Progress<double>(pct =>
-        {
-            // Progress is already logged inside TorrentService
-        });
-
-        var localPath = await torrentService.DownloadFileAsync(
-            fileIndex, downloadDir, downloadProgress, ct);
-        dlStopwatch.Stop();
-
         // Upload
         var ulStopwatch = Stopwatch.StartNew();
-        var uploadProgress = new Progress<long>(bytes =>
-        {
-            // Progress is already logged inside GoogleDriveService
-        });
+        var uploadProgress = new Progress<long>(_ => { });
 
         var driveFileId = await driveService.UploadFileAsync(
-            localPath, targetFolderId, uploadProgress, ct);
+            completed.LocalPath, targetFolderId, uploadProgress, ct);
         ulStopwatch.Stop();
 
         // Delete local file
         try
         {
-            if (File.Exists(localPath))
+            if (File.Exists(completed.LocalPath))
             {
-                var fileSize = new FileInfo(localPath).Length;
-                File.Delete(localPath);
+                var fileSize = new FileInfo(completed.LocalPath).Length;
+                File.Delete(completed.LocalPath);
                 logger.LogInformation(
                     "Deleted temp file: {Path} ({Size:F2} MB freed)",
-                    localPath, fileSize / 1024.0 / 1024.0);
+                    completed.LocalPath, fileSize / 1024.0 / 1024.0);
             }
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Failed to delete temp file: {Path}", localPath);
+            logger.LogWarning(ex, "Failed to delete temp file: {Path}", completed.LocalPath);
         }
 
         return new FileProcessResult(
             FileName: fileInfo.Path,
             FileSize: fileInfo.Size,
             DriveFileId: driveFileId,
-            DownloadTime: dlStopwatch.Elapsed,
+            DownloadTime: completed.DownloadTime,
             UploadTime: ulStopwatch.Elapsed);
     }
 
@@ -149,7 +144,7 @@ public sealed class TorrentWorker(
         logger.LogInformation("Torrent: {Name}", metadata.Name);
         logger.LogInformation("Files:   {Count}", metadata.Files.Count);
         logger.LogInformation("Total:   {Size:F2} MB", metadata.TotalSize / 1024.0 / 1024.0);
-        logger.LogInformation("Largest: {Size:F2} MB (max disk usage)",
+        logger.LogInformation("Largest: {Size:F2} MB (max disk per slot)",
             metadata.Files.Max(f => f.Size) / 1024.0 / 1024.0);
         logger.LogInformation("─────────────────────────────────────────");
 
@@ -177,6 +172,7 @@ public sealed class TorrentWorker(
         logger.LogInformation("Total size:     {Size:F2} MB", totalSize / 1024.0 / 1024.0);
         logger.LogInformation("Total download: {Time}", totalDlTime);
         logger.LogInformation("Total upload:   {Time}", totalUlTime);
-        logger.LogInformation("Total time:     {Time}", totalDlTime + totalUlTime);
+        logger.LogInformation("Wall time:      {Time} (downloads were concurrent)",
+            TimeSpan.FromTicks(Math.Max(totalDlTime.Ticks, totalUlTime.Ticks)));
     }
 }

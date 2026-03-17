@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Net;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using MonoTorrent;
@@ -157,6 +159,152 @@ public sealed class TorrentService : ITorrentService, IDisposable
 
         _logger.LogInformation("Download complete: {Path}", targetFile.FullPath);
         return targetFile.FullPath;
+    }
+
+    /// <inheritdoc />
+    public ChannelReader<CompletedFileEvent> DownloadFilesConcurrentlyAsync(
+        int maxConcurrent, CancellationToken ct = default)
+    {
+        if (_manager is null || _engine is null)
+            throw new InvalidOperationException("Torrent not loaded. Call LoadTorrentAsync first.");
+
+        var channel = Channel.CreateUnbounded<CompletedFileEvent>();
+
+        // Fire-and-forget the download loop — it writes to the channel
+        _ = RunConcurrentDownloadsAsync(maxConcurrent, channel.Writer, ct);
+
+        return channel.Reader;
+    }
+
+    /// <summary>
+    /// Core concurrent download loop. Sets up to N files to HIGH priority,
+    /// polls progress, and writes completed files to the channel.
+    /// </summary>
+    private async Task RunConcurrentDownloadsAsync(
+        int maxConcurrent, ChannelWriter<CompletedFileEvent> writer, CancellationToken ct)
+    {
+        try
+        {
+            var fileCount = _manager!.Files.Count;
+            var effectiveConcurrent = Math.Min(maxConcurrent, fileCount);
+
+            _logger.LogInformation(
+                "Starting concurrent download: {Concurrent} slots for {Total} files",
+                effectiveConcurrent, fileCount);
+
+            // Set all files to DoNotDownload initially
+            foreach (var file in _manager.Files)
+            {
+                await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
+            }
+
+            // Track active downloads and the file queue
+            var fileQueue = new Queue<int>(Enumerable.Range(0, fileCount));
+            var activeFiles = new Dictionary<int, Stopwatch>(); // fileIndex → stopwatch
+
+            // Fill initial batch
+            while (activeFiles.Count < effectiveConcurrent && fileQueue.Count > 0)
+            {
+                var idx = fileQueue.Dequeue();
+                await ActivateFileAsync(idx, activeFiles);
+            }
+
+            // Start the manager
+            await _manager.StartAsync();
+
+            // Poll loop
+            while (activeFiles.Count > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                // Check for completed files
+                var completedIndices = new List<int>();
+                foreach (var (idx, sw) in activeFiles)
+                {
+                    if (_manager.Files[idx].BitField.PercentComplete >= 100.0)
+                    {
+                        completedIndices.Add(idx);
+                    }
+                }
+
+                // Process completed files
+                foreach (var idx in completedIndices)
+                {
+                    var sw = activeFiles[idx];
+                    sw.Stop();
+
+                    var file = _manager.Files[idx];
+                    await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
+
+                    _logger.LogInformation(
+                        "✓ Download complete [{Index}/{Total}]: {Path} in {Time:F1}s",
+                        idx + 1, fileCount, file.Path, sw.Elapsed.TotalSeconds);
+
+                    // Write to channel for upload processing
+                    await writer.WriteAsync(new CompletedFileEvent(
+                        FileIndex: idx,
+                        LocalPath: file.FullPath,
+                        DownloadTime: sw.Elapsed), ct);
+
+                    activeFiles.Remove(idx);
+
+                    // Activate next file from queue
+                    if (fileQueue.Count > 0)
+                    {
+                        var nextIdx = fileQueue.Dequeue();
+                        await ActivateFileAsync(nextIdx, activeFiles);
+                    }
+                }
+
+                // Log progress for active files
+                if (activeFiles.Count > 0)
+                {
+                    var downSpeed = _engine!.TotalDownloadRate / 1024.0 / 1024.0;
+                    var peers = await _manager.GetPeersAsync();
+
+                    foreach (var (idx, _) in activeFiles)
+                    {
+                        var file = _manager.Files[idx];
+                        var pct = file.BitField.PercentComplete;
+                        _logger.LogInformation(
+                            "  [{Index}] {Name}: {Progress:F1}%",
+                            idx + 1, Path.GetFileName(file.Path), pct);
+                    }
+
+                    _logger.LogInformation(
+                        "  ↓ {Speed:F2} MB/s | Peers: {Peers} | Active: {Active} | Remaining: {Queue}",
+                        downSpeed, peers.Count, activeFiles.Count, fileQueue.Count);
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(3), ct);
+            }
+
+            // Stop the manager after all files are done
+            await _manager.StopAsync();
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Error during concurrent downloads");
+        }
+        finally
+        {
+            writer.Complete();
+        }
+    }
+
+    /// <summary>
+    /// Activate a file for download: set priority to HIGH and start tracking.
+    /// </summary>
+    private async Task ActivateFileAsync(int fileIndex, Dictionary<int, Stopwatch> activeFiles)
+    {
+        var file = _manager!.Files[fileIndex];
+        await _manager.SetFilePriorityAsync(file, Priority.High);
+        activeFiles[fileIndex] = Stopwatch.StartNew();
+
+        _logger.LogInformation(
+            "→ Queued for download [{Index}/{Total}]: {Path} ({Size:F2} MB)",
+            fileIndex + 1, _manager.Files.Count, file.Path,
+            file.Length / 1024.0 / 1024.0);
     }
 
     /// <inheritdoc />

@@ -20,4 +20,7 @@ public sealed record TorrentSettings
 
     /// <summary>Persist DHT cache for faster peer discovery on restart.</summary>
     public bool AutoSaveLoadDhtCache { get; init; } = true;
+
+    /// <summary>Maximum number of files to download concurrently within a torrent.</summary>
+    public int MaxConcurrentFiles { get; init; } = 6;
 }

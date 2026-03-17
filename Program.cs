@@ -22,16 +22,19 @@ var downloadCommand = new Command("download", "Download torrent → upload to Go
 var torrentOption = new Option<string?>("--torrent") { Description = "Path to a .torrent file" };
 var magnetOption = new Option<string?>("--magnet") { Description = "Magnet URI" };
 var driveFolderOption = new Option<string?>("--drive-folder") { Description = "Target Google Drive folder ID" };
+var concurrentOption = new Option<int?>("--concurrent") { Description = "Max concurrent file downloads (default: 6)" };
 
 downloadCommand.Options.Add(torrentOption);
 downloadCommand.Options.Add(magnetOption);
 downloadCommand.Options.Add(driveFolderOption);
+downloadCommand.Options.Add(concurrentOption);
 
 downloadCommand.SetAction(async (parseResult, ct) =>
 {
     var torrentPath = parseResult.GetValue(torrentOption);
     var magnet = parseResult.GetValue(magnetOption);
     var driveFolderId = parseResult.GetValue(driveFolderOption);
+    var concurrent = parseResult.GetValue(concurrentOption);
 
     if (string.IsNullOrEmpty(torrentPath) && string.IsNullOrEmpty(magnet))
     {
@@ -43,7 +46,8 @@ downloadCommand.SetAction(async (parseResult, ct) =>
     {
         TorrentPath = torrentPath,
         Magnet = magnet,
-        DriveFolderId = driveFolderId
+        DriveFolderId = driveFolderId,
+        MaxConcurrentFiles = concurrent
     };
 
     var builder = Host.CreateApplicationBuilder();

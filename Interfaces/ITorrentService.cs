@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using TorrentProject.Models;
 
 namespace TorrentProject.Interfaces;
@@ -23,6 +24,15 @@ public interface ITorrentService
         int fileIndex,
         string downloadDirectory,
         IProgress<double>? progress = null,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Download multiple files concurrently. Returns a ChannelReader that yields
+    /// CompletedFileEvent as each file finishes downloading. The engine stays running
+    /// and manages up to maxConcurrent files at a time with Priority.High.
+    /// </summary>
+    ChannelReader<CompletedFileEvent> DownloadFilesConcurrentlyAsync(
+        int maxConcurrent,
         CancellationToken ct = default);
 
     /// <summary>
