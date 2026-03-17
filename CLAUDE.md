@@ -4,27 +4,39 @@
 
 A .NET 9 console application that **downloads torrent files and uploads them directly to Google Drive**, optimized for **limited disk space** (30GB HDD).
 
-### Architecture: Sequential Per-File Download → Upload → Delete → Next File
+### Architecture: Speed Probe → Concurrent Download → Upload → Delete
 
 ```
 .torrent / Magnet Link
         │
         ▼
-┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  MonoTorrent     │ ──▶ │  Temp Folder  │ ──▶ │  Google Drive   │
-│  Engine          │     │  (ONE file   │     │  Resumable      │
-│  (sequential DL) │     │   at a time) │     │  Upload         │
-└─────────────────┘     └──────────────┘     └─────────────────┘
-                                │                     │
-                                └──── Delete ◄────────┘
-                                       │
-                                       ▼
-                                  Next file...
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  MonoTorrent     │ ──▶ │  Speed Probe     │ ──▶ │  Concurrent DL  │
+│  Engine          │     │  (30s analysis)  │     │  (up to 6 files)│
+└─────────────────┘     └──────────────────┘     └────────┬────────┘
+                                                          │
+                              ┌────────────────────────────┘
+                              ▼
+                   ┌──────────────┐     ┌─────────────────┐
+                   │  Temp Folder  │ ──▶ │  Google Drive   │
+                   │  (completed  │     │  Resumable      │
+                   │   files)     │     │  Upload         │
+                   └──────────────┘     └─────────────────┘
+                           │                     │
+                           └──── Delete ◄────────┘
+                                  │
+                                  ▼
+                             Next file...
 ```
 
 **Key constraint**: Only ~30GB of disk space available.
-**Strategy**: Process one file at a time — download, upload to Drive, delete locally, then move to the next file.
-**Max disk usage** = size of the largest single file in the torrent (not the full torrent).
+**Strategy**: Probe all files (30s), rank by download speed, then download fastest first with up to 6 concurrent slots.
+**Max disk usage** = sum of concurrently active files (not the full torrent).
+
+### Two Operating Modes
+
+- **One-Shot** (`download` verb): Single torrent, download → upload → exit
+- **Daemon** (`daemon` verb): Interactive mode, manage multiple torrents with `add/status/progress/pause/resume/stop/quit`
 
 ---
 
@@ -47,27 +59,31 @@ A .NET 9 console application that **downloads torrent files and uploads them dir
 ```
 TorrentProject/
 ├── CLAUDE.md                         # This file – project guidelines
-├── .claude/skills/                   # AI-assistant skills
+├── ARCHITECTURE.md                   # Architecture deep dive
+├── REFACTOR.md                       # Clean code standards
 ├── Configuration/
-│   ├── TorrentSettings.cs            # MonoTorrent config
+│   ├── TorrentSettings.cs            # MonoTorrent config + concurrency + probe
 │   └── GoogleDriveSettings.cs        # Drive upload config
 ├── Interfaces/
-│   ├── ITorrentService.cs            # Contract: download torrent
+│   ├── ITorrentService.cs            # Contract: download + probe + concurrent
 │   └── IGoogleDriveService.cs        # Contract: upload to Drive
 ├── Services/
-│   ├── TorrentService.cs             # MonoTorrent download implementation
-│   ├── GoogleDriveService.cs         # Google Drive upload implementation
-│   └── GoogleAuthService.cs          # Auth: Service Account or OAuth2
+│   ├── TorrentService.cs             # MonoTorrent: load, probe, download
+│   ├── GoogleDriveService.cs         # Google Drive resumable upload
+│   ├── GoogleAuthService.cs          # Auth: Service Account or OAuth2
+│   ├── DownloadManager.cs            # Multi-torrent job orchestrator (daemon)
+│   └── CommandHandler.cs             # Interactive stdin command loop (daemon)
 ├── Workers/
-│   └── TorrentWorker.cs              # BackgroundService orchestrator
+│   └── TorrentWorker.cs              # One-shot download orchestrator
 ├── Models/
-│   ├── DownloadRequest.cs            # Input: torrent path/magnet + target folder
-│   ├── DownloadResult.cs             # Output: status, file paths
-│   └── TorrentFileInfo.cs            # Per-file metadata (name, size, priority)
-├── Program.cs                        # Host setup, DI registration
+│   ├── DownloadRequest.cs            # CLI args: torrent/magnet/concurrent
+│   ├── TorrentMetadata.cs            # Torrent-level metadata
+│   ├── TorrentFileInfo.cs            # Per-file metadata (name, size)
+│   ├── CompletedFileEvent.cs         # Channel event for completed downloads
+│   ├── FileProcessResult.cs          # Per-file result (DL/UL times, Drive ID)
+│   └── TorrentJob.cs                 # Per-job state machine (daemon mode)
+├── Program.cs                        # CLI: download / daemon / auth / list-files
 ├── appsettings.json                  # Runtime configuration
-├── service-account.json              # Google SA key (VPS, git-ignored)
-├── credentials.json                  # Google OAuth2 client secret (local dev, git-ignored)
 └── TorrentProject.csproj
 ```
 
@@ -106,7 +122,9 @@ TorrentProject/
     "MaxConnections": 60,
     "AllowPortForwarding": true,
     "AutoSaveLoadFastResume": true,
-    "AutoSaveLoadDhtCache": true
+    "AutoSaveLoadDhtCache": true,
+    "MaxConcurrentFiles": 6,
+    "SpeedProbeDurationSeconds": 30
   },
   "GoogleDriveSettings": {
     "ServiceAccountKeyPath": "./service-account.json",
@@ -122,34 +140,38 @@ TorrentProject/
 
 ## Key Workflows
 
-### Per-File Processing Loop (Core Algorithm)
+### Speed Probe (Pre-Download Analysis)
 
 ```
-For each file in torrent (sorted by index):
-  1. Set priority HIGH for this file, LOW for all others
-  2. Download this file to temp folder
-  3. Upload to Google Drive (resumable, chunked)
+1. Set ALL files to Priority.Normal
+2. Start MonoTorrent engine for SpeedProbeDurationSeconds (default: 30)
+3. Record bytes received per file
+4. Stop engine → rank files by descending speed
+5. Return sorted file indices (fastest first)
+```
+
+### Concurrent Per-File Processing (Core Algorithm)
+
+```
+For up to MaxConcurrentFiles (default: 6) files simultaneously:
+  1. Set active files to HIGH priority, queued files to DO_NOT_DOWNLOAD
+  2. As each file completes → Channel<CompletedFileEvent>
+  3. Upload completed file to Google Drive (resumable, chunked)
   4. Delete local temp file
-  5. Move to next file
+  5. Activate next file from queue
 ```
 
-### 1. Download Torrent (Per-File)
-1. Parse `.torrent` file or magnet link via MonoTorrent
-2. Enumerate all files in the torrent
-3. For each file: set it to HIGH priority, set all others to DO_NOT_DOWNLOAD
-4. Wait for that file to complete (monitor `file.BitField.PercentComplete`)
-5. Report progress via logging (percentage, speed, peers)
+### Daemon Mode Workflow
 
-### 2. Upload to Google Drive
-1. Authenticate via Service Account (auto-detected if `service-account.json` exists)
-2. Create resumable upload session for the downloaded file
-3. Upload in chunks (configurable `ChunkSizeMB`)
-4. Return the Google Drive file ID on success
-
-### 3. Cleanup & Next
-1. Delete the temp file immediately after successful upload
-2. Log status (Drive file ID, file size, time taken)
-3. Repeat for next file in the torrent
+```
+1. User runs: dotnet run -- daemon
+2. App starts interactive command loop
+3. User adds torrents: add --magnet "..."
+4. Each torrent → TorrentJob: probe → download → upload (background)
+5. User checks progress on demand: status / progress <id>
+6. User can pause/resume/stop individual jobs
+7. User exits: quit → graceful shutdown
+```
 
 ---
 
@@ -200,12 +222,14 @@ scp -r ./publish/ user@vps:/opt/torrentproject/
 ### Core Commands
 
 ```bash
-# Download torrent → upload to Drive (main workflow)
+# One-shot: download torrent → upload to Drive (probe + concurrent)
 dotnet run -- download --torrent "path/to/file.torrent"
 dotnet run -- download --magnet "magnet:?xt=urn:btih:..."
-
-# Specify target Drive folder
 dotnet run -- download --torrent "file.torrent" --drive-folder "FolderIdHere"
+dotnet run -- download --magnet "..." --concurrent 3
+
+# Interactive daemon mode (manage multiple torrents)
+dotnet run -- daemon
 
 # Authenticate with Google (opens browser — run on local machine)
 dotnet run -- auth
@@ -215,11 +239,23 @@ dotnet run -- list-files --torrent "file.torrent"
 dotnet run -- list-files --magnet "magnet:?xt=urn:btih:..."
 ```
 
+### Daemon Commands
+
+```
+> add --magnet "magnet:?xt=..."     Add torrent
+> add --torrent "file.torrent"      Add from file
+> status                            Summary of all jobs
+> progress <id>                     Per-file detail
+> pause <id>                        Pause a job
+> resume <id>                       Resume a job
+> stop <id>                         Remove a job
+> quit                              Shutdown
+```
+
 ### On VPS (Published Binary)
 
 ```bash
-# Using the published binary directly
-/opt/torrentproject/TorrentProject download --torrent "/path/to/file.torrent"
+/opt/torrentproject/TorrentProject daemon
 /opt/torrentproject/TorrentProject download --magnet "magnet:?xt=urn:btih:..."
 /opt/torrentproject/TorrentProject list-files --torrent "/path/to/file.torrent"
 ```
@@ -240,7 +276,7 @@ After=network.target
 Type=simple
 User=torrent
 WorkingDirectory=/opt/torrentproject
-ExecStart=/opt/torrentproject/TorrentProject download --torrent "/path/to/file.torrent"
+ExecStart=/opt/torrentproject/TorrentProject daemon
 Restart=on-failure
 RestartSec=10
 Environment=DOTNET_ENVIRONMENT=Production
@@ -263,12 +299,12 @@ journalctl -u torrentproject -f
 
 | Command | Description |
 |---|---|
-| `download --torrent <path>` | Download torrent file → upload to Drive |
-| `download --magnet <link>` | Download via magnet link → upload to Drive |
-| `download --torrent <path> --drive-folder <id>` | Upload to specific Drive folder |
+| `download --torrent <path>` | One-shot: probe → download → upload to Drive |
+| `download --magnet <link>` | Same via magnet link |
+| `download ... --concurrent <N>` | Override max concurrent files |
+| `daemon` | Interactive mode: manage multiple torrents |
 | `auth` | Authenticate with Google (needs browser) |
-| `list-files --torrent <path>` | Show files in torrent without downloading |
-| `list-files --magnet <link>` | Show files from magnet link without downloading |
+| `list-files --torrent <path>` | Show files without downloading |
 
 ---
 
@@ -285,10 +321,11 @@ obj/
 
 ---
 
-## Future Enhancements (Not in scope for v1)
+## Future Enhancements
 
 - **Option A migration**: Stream pieces directly to Drive via resumable upload
 - **Web UI / API**: ASP.NET minimal API for remote control
-- **Queue system**: Process multiple torrents sequentially
 - **Notifications**: Email/Telegram alerts on completion
 - **Disk space check**: Pre-validate largest file fits in available disk before starting
+- **Global concurrency pool**: Shared semaphore across all daemon jobs
+- **Auto-retry**: Automatic retry with exponential backoff on upload failures

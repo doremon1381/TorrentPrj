@@ -23,4 +23,7 @@ public sealed record TorrentSettings
 
     /// <summary>Maximum number of files to download concurrently within a torrent.</summary>
     public int MaxConcurrentFiles { get; init; } = 6;
+
+    /// <summary>Duration in seconds to probe file download speeds before prioritizing.</summary>
+    public int SpeedProbeDurationSeconds { get; init; } = 30;
 }

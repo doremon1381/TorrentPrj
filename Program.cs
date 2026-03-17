@@ -73,6 +73,29 @@ downloadCommand.SetAction(async (parseResult, ct) =>
 
 rootCommand.Subcommands.Add(downloadCommand);
 
+// ── daemon ─────────────────────────────────────────────────────
+var daemonCommand = new Command("daemon", "Interactive daemon mode: add/manage multiple torrents");
+
+daemonCommand.SetAction(async (parseResult, ct) =>
+{
+    var builder = Host.CreateApplicationBuilder();
+
+    builder.Services.Configure<TorrentSettings>(
+        builder.Configuration.GetSection(nameof(TorrentSettings)));
+    builder.Services.Configure<GoogleDriveSettings>(
+        builder.Configuration.GetSection(nameof(GoogleDriveSettings)));
+
+    builder.Services.AddSingleton<GoogleAuthService>();
+    builder.Services.AddSingleton<IGoogleDriveService, GoogleDriveService>();
+    builder.Services.AddSingleton<DownloadManager>();
+    builder.Services.AddHostedService<CommandHandler>();
+
+    var host = builder.Build();
+    await host.RunAsync(ct);
+});
+
+rootCommand.Subcommands.Add(daemonCommand);
+
 // ── auth ──────────────────────────────────────────────────────
 var authCommand = new Command("auth", "Authenticate with Google (opens browser for OAuth2)");
 

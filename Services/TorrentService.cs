@@ -13,7 +13,7 @@ using TorrentFileInfo = TorrentProject.Models.TorrentFileInfo;
 namespace TorrentProject.Services;
 
 /// <summary>
-/// MonoTorrent-based torrent service. Manages loading, per-file downloading, and cleanup.
+/// MonoTorrent-based torrent service. Manages loading, speed probing, per-file downloading, and cleanup.
 /// </summary>
 public sealed class TorrentService : ITorrentService, IDisposable
 {
@@ -77,6 +77,35 @@ public sealed class TorrentService : ITorrentService, IDisposable
     }
 
     /// <inheritdoc />
+    public async Task<int[]> ProbeFileSpeedsAsync(
+        TimeSpan duration, CancellationToken ct = default)
+    {
+        EnsureLoaded();
+
+        var fileCount = _manager!.Files.Count;
+        _logger.LogInformation(
+            "Speed probe: analyzing {Count} files for {Duration}s...",
+            fileCount, duration.TotalSeconds);
+
+        // Record initial byte counts
+        var initialBytes = RecordFileByteCounts();
+
+        // Set all files to Normal priority and start downloading
+        await SetAllFilesPriorityAsync(Priority.Normal);
+        await _manager.StartAsync();
+
+        // Wait for probe duration
+        await Task.Delay(duration, ct);
+
+        // Record final byte counts
+        var finalBytes = RecordFileByteCounts();
+        await _manager.StopAsync();
+
+        // Calculate speeds and sort
+        return RankFilesBySpeed(initialBytes, finalBytes, duration);
+    }
+
+    /// <inheritdoc />
     public async Task<string> DownloadFileAsync(
         int fileIndex, string downloadDirectory,
         IProgress<double>? progress = null, CancellationToken ct = default)
@@ -100,12 +129,12 @@ public sealed class TorrentService : ITorrentService, IDisposable
 
     /// <inheritdoc />
     public ChannelReader<CompletedFileEvent> DownloadFilesConcurrentlyAsync(
-        int maxConcurrent, CancellationToken ct = default)
+        int maxConcurrent, int[]? fileOrder = null, CancellationToken ct = default)
     {
         EnsureLoaded();
 
         var channel = Channel.CreateUnbounded<CompletedFileEvent>();
-        _ = RunConcurrentDownloadsAsync(maxConcurrent, channel.Writer, ct);
+        _ = RunConcurrentDownloadsAsync(maxConcurrent, fileOrder, channel.Writer, ct);
 
         return channel.Reader;
     }
@@ -229,6 +258,64 @@ public sealed class TorrentService : ITorrentService, IDisposable
 
     #endregion
 
+    #region Private Methods — Speed Probe
+
+    /// <summary>
+    /// Record current byte counts for all files.
+    /// </summary>
+    private long[] RecordFileByteCounts()
+    {
+        var counts = new long[_manager!.Files.Count];
+        for (var i = 0; i < _manager.Files.Count; i++)
+        {
+            var bf = _manager.Files[i].BitField;
+            counts[i] = bf.TrueCount * _manager.Torrent!.PieceLength;
+        }
+        return counts;
+    }
+
+    /// <summary>
+    /// Rank files by download speed (bytes received during probe), fastest first.
+    /// </summary>
+    private int[] RankFilesBySpeed(long[] initialBytes, long[] finalBytes, TimeSpan duration)
+    {
+        var speeds = new List<(int Index, double BytesPerSec)>();
+
+        for (var i = 0; i < _manager!.Files.Count; i++)
+        {
+            var bytesReceived = finalBytes[i] - initialBytes[i];
+            var speed = bytesReceived / duration.TotalSeconds;
+            speeds.Add((i, speed));
+
+            _logger.LogInformation(
+                "  [{Index}] {Name}: {Speed:F2} KB/s",
+                i + 1, Path.GetFileName(_manager.Files[i].Path), speed / 1024.0);
+        }
+
+        var sorted = speeds
+            .OrderByDescending(s => s.BytesPerSec)
+            .Select(s => s.Index)
+            .ToArray();
+
+        _logger.LogInformation("Speed probe complete. Download order: {Order}",
+            string.Join(", ", sorted.Select(i => $"[{i + 1}]")));
+
+        return sorted;
+    }
+
+    /// <summary>
+    /// Set all files to a given priority.
+    /// </summary>
+    private async Task SetAllFilesPriorityAsync(Priority priority)
+    {
+        foreach (var file in _manager!.Files)
+        {
+            await _manager.SetFilePriorityAsync(file, priority);
+        }
+    }
+
+    #endregion
+
     #region Private Methods — Single-File Download
 
     /// <summary>
@@ -245,11 +332,8 @@ public sealed class TorrentService : ITorrentService, IDisposable
     /// </summary>
     private async Task SetSingleFilePriorityAsync(int fileIndex)
     {
-        foreach (var file in _manager!.Files)
-        {
-            await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
-        }
-        await _manager.SetFilePriorityAsync(_manager.Files[fileIndex], Priority.High);
+        await SetAllFilesPriorityAsync(Priority.DoNotDownload);
+        await _manager!.SetFilePriorityAsync(_manager.Files[fileIndex], Priority.High);
     }
 
     /// <summary>
@@ -286,20 +370,22 @@ public sealed class TorrentService : ITorrentService, IDisposable
     /// polls progress, and writes completed files to the channel.
     /// </summary>
     private async Task RunConcurrentDownloadsAsync(
-        int maxConcurrent, ChannelWriter<CompletedFileEvent> writer, CancellationToken ct)
+        int maxConcurrent, int[]? fileOrder,
+        ChannelWriter<CompletedFileEvent> writer, CancellationToken ct)
     {
         try
         {
             var fileCount = _manager!.Files.Count;
             var effectiveConcurrent = Math.Min(maxConcurrent, fileCount);
+            var orderedIndices = fileOrder ?? Enumerable.Range(0, fileCount).ToArray();
 
             _logger.LogInformation(
                 "Starting concurrent download: {Concurrent} slots for {Total} files",
                 effectiveConcurrent, fileCount);
 
-            await SetAllFilesDoNotDownloadAsync();
+            await SetAllFilesPriorityAsync(Priority.DoNotDownload);
 
-            var fileQueue = new Queue<int>(Enumerable.Range(0, fileCount));
+            var fileQueue = new Queue<int>(orderedIndices);
             var activeFiles = new Dictionary<int, Stopwatch>();
 
             FillInitialBatch(fileQueue, activeFiles, effectiveConcurrent);
@@ -315,17 +401,6 @@ public sealed class TorrentService : ITorrentService, IDisposable
         finally
         {
             writer.Complete();
-        }
-    }
-
-    /// <summary>
-    /// Set all files to DoNotDownload priority.
-    /// </summary>
-    private async Task SetAllFilesDoNotDownloadAsync()
-    {
-        foreach (var file in _manager!.Files)
-        {
-            await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
         }
     }
 

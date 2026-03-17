@@ -36,8 +36,13 @@ public sealed class TorrentWorker(
 
             logger.LogInformation("Download mode: {Concurrent} concurrent file(s)", maxConcurrent);
 
+            // Speed probe: analyze file speeds, then download fastest first
+            var probeDuration = TimeSpan.FromSeconds(
+                torrentSettings.Value.SpeedProbeDurationSeconds);
+            var fileOrder = await torrentService.ProbeFileSpeedsAsync(probeDuration, stoppingToken);
+
             var completedReader = torrentService.DownloadFilesConcurrentlyAsync(
-                maxConcurrent, stoppingToken);
+                maxConcurrent, fileOrder, stoppingToken);
 
             await ProcessCompletedFilesAsync(
                 completedReader, metadata, torrentFolderId, results, stoppingToken);

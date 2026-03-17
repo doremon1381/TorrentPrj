@@ -6,13 +6,15 @@ Download torrent files and save them to Google Drive, with only **~30GB of local
 
 A naive approach (download entire torrent → upload → delete) would fail for large torrents that exceed available disk.
 
-## Solution: Sequential Per-File Pipeline
+## Solution: Concurrent Per-File Pipeline with Speed-Based Prioritization
 
-Process **one file at a time** from the torrent, immediately uploading and deleting before moving to the next. Max disk usage = **largest single file** in the torrent, not the total torrent size.
+Process files from the torrent concurrently (up to N at a time), with **fastest files prioritized first** via an initial speed probe. Each completed file is immediately uploaded to Google Drive and deleted locally. Max disk usage = **sum of N largest concurrent files**, not the total torrent size.
 
 ---
 
 ## System Overview
+
+### One-Shot Mode (download verb)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -20,41 +22,48 @@ Process **one file at a time** from the torrent, immediately uploading and delet
 │                     (BackgroundService)                               │
 │                                                                      │
 │  ┌─────────────┐                                                     │
-│  │ Parse input  │ ← --torrent "file.torrent"                         │
-│  │ (file/magnet)│ ← --magnet  "magnet:?xt=..."                       │
+│  │ Parse input  │ ← --torrent / --magnet / --concurrent              │
 │  └──────┬──────┘                                                     │
 │         ▼                                                            │
 │  ┌─────────────────┐                                                 │
-│  │ MonoTorrent      │  Enumerate files in torrent                     │
-│  │ Load Metadata    │  [file1.mkv (4GB), file2.mkv (3GB), sub.srt]   │
+│  │ Load Metadata    │  [ep01..ep13, subs (13 files)]                 │
 │  └──────┬──────────┘                                                 │
 │         ▼                                                            │
-│  ┌──────────────────────────── PER-FILE LOOP ──────────────────────┐ │
+│  ┌─────────────────┐                                                 │
+│  │ Speed Probe (30s)│  Probe all files → rank by bytes/sec           │
+│  │                  │  Result: [ep05, ep02, ep09, ..., ep07]          │
+│  └──────┬──────────┘                                                 │
+│         ▼                                                            │
+│  ┌──────────────────── CONCURRENT DOWNLOAD (up to 6) ─────────────┐ │
+│  │  Slot 1: ep05 → downloading 67%                                  │ │
+│  │  Slot 2: ep02 → downloading 34%                                  │ │
+│  │  Slot 3: ep09 → downloading 12%                                  │ │
+│  │  Slot 4: (waiting for slot)                                      │ │
 │  │                                                                  │ │
-│  │  ┌──────────────────┐                                            │ │
-│  │  │ Set file priority │  current = HIGH, others = DO_NOT_DOWNLOAD │ │
-│  │  └───────┬──────────┘                                            │ │
-│  │          ▼                                                       │ │
-│  │  ┌──────────────────┐                                            │ │
-│  │  │ Download file     │  MonoTorrent → ./temp/file1.mkv            │ │
-│  │  │ (poll progress)   │  "Progress: 45.2% | 2.1 MB/s | 15 peers" │ │
-│  │  └───────┬──────────┘                                            │ │
-│  │          ▼                                                       │ │
-│  │  ┌──────────────────┐                                            │ │
-│  │  │ Upload to Drive   │  Resumable upload in 10MB chunks          │ │
-│  │  │ (track progress)  │  "Upload: 72% | 3.5 MB/s"                │ │
-│  │  └───────┬──────────┘                                            │ │
-│  │          ▼                                                       │ │
-│  │  ┌──────────────────┐                                            │ │
-│  │  │ Delete temp file  │  Free disk for next file                  │ │
-│  │  └───────┬──────────┘                                            │ │
-│  │          ▼                                                       │ │
-│  │     Next file...                                                 │ │
+│  │  On completion → Channel<CompletedFileEvent> → upload → delete    │ │
 │  └──────────────────────────────────────────────────────────────────┘ │
 │         ▼                                                            │
 │  ┌─────────────┐                                                     │
 │  │ Shutdown     │  lifetime.StopApplication()                        │
 │  └─────────────┘                                                     │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Daemon Mode (daemon verb)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Program.cs ("daemon" verb)                                          │
+│                                                                      │
+│  ┌────────────────────┐    ┌───────────────────────────────────────┐ │
+│  │  CommandHandler     │    │  DownloadManager                     │ │
+│  │  (stdin loop)       │───▶│                                     │ │
+│  │                     │    │  Manages List<TorrentJob>            │ │
+│  │  add / status /     │◀───│  Per-job: probe → download → upload │ │
+│  │  progress / pause / │    │  Per-job CancellationTokenSource     │ │
+│  │  resume / stop /    │    │  Progress on-demand only             │ │
+│  │  quit               │    │                                     │ │
+│  └────────────────────┘    └───────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -66,84 +75,78 @@ Process **one file at a time** from the torrent, immediately uploading and delet
 ┌──────────────────────────────────────────────────┐
 │                   Program.cs                      │
 │                                                  │
-│  Host.CreateApplicationBuilder(args)             │
+│  "download" verb (one-shot):                     │
 │  ├── Configure<TorrentSettings>                  │
 │  ├── Configure<GoogleDriveSettings>              │
-│  ├── AddSingleton<GoogleAuthService>             │
 │  ├── AddSingleton<ITorrentService>               │
 │  ├── AddSingleton<IGoogleDriveService>           │
 │  └── AddHostedService<TorrentWorker>             │
+│                                                  │
+│  "daemon" verb (interactive):                    │
+│  ├── Configure<TorrentSettings>                  │
+│  ├── Configure<GoogleDriveSettings>              │
+│  ├── AddSingleton<IGoogleDriveService>           │
+│  ├── AddSingleton<DownloadManager>               │
+│  └── AddHostedService<CommandHandler>            │
 └──────────────────┬───────────────────────────────┘
                    │ DI injects into
                    ▼
-┌──────────────────────────────────────────────────┐
-│             TorrentWorker                         │
-│          (BackgroundService)                      │
-│                                                  │
-│  Dependencies:                                   │
-│  ├── ITorrentService                             │
-│  ├── IGoogleDriveService                         │
-│  ├── IOptions<TorrentSettings>                   │
-│  ├── IOptions<GoogleDriveSettings>               │
-│  ├── ILogger<TorrentWorker>                      │
-│  └── IHostApplicationLifetime                    │
-│                                                  │
-│  Orchestrates: parse → download → upload → clean │
-└──────┬────────────────────────┬──────────────────┘
-       │                        │
-       ▼                        ▼
-┌────────────────┐    ┌─────────────────────┐
-│ TorrentService │    │ GoogleDriveService   │
-│                │    │                     │
-│ Implements:    │    │ Implements:         │
-│ ITorrentService│    │ IGoogleDriveService │
-│                │    │                     │
-│ Uses:          │    │ Uses:               │
-│ MonoTorrent    │    │ Google.Apis.Drive.v3│
-│ ClientEngine   │    │ GoogleAuthService   │
-└────────────────┘    └─────────────────────┘
+┌────────────────┐  ┌───────────────┐  ┌──────────────────┐
+│ TorrentService │  │ DownloadManager│  │ CommandHandler   │
+│                │  │               │  │ (stdin loop)     │
+│ Implements:    │  │ Manages N     │  │                  │
+│ ITorrentService│  │ TorrentJobs   │  │ Dispatches to    │
+│                │  │               │  │ DownloadManager  │
+│ Features:      │  │ Per-job CTS   │  └──────────────────┘
+│ • Load torrent │  │ Per-job       │
+│ • Speed probe  │  │ TorrentService│  ┌──────────────────┐
+│ • Single DL    │  │ instance      │  │ GoogleDriveService│
+│ • Concurrent   │  └───────────────┘  │                  │
+│   DL (Channel) │                     │ Resumable upload │
+└────────────────┘                     │ GoogleAuthService│
+                                       └──────────────────┘
 ```
 
 ---
 
-## Data Flow (Per File)
+## Data Flow
 
 ```
-Step 1: PRIORITY MANAGEMENT
+Step 1: SPEED PROBE (30 seconds)
 ─────────────────────────────────
-Torrent contains: [ep01.mkv, ep02.mkv, ep03.mkv, subs.srt]
+Torrent contains: [ep01..ep13, subs.srt]
+All files → Priority.Normal → start engine → measure bytes/sec per file
 
-Round 1: ep01.mkv = HIGH,   others = DO_NOT_DOWNLOAD
-Round 2: ep02.mkv = HIGH,   others = DO_NOT_DOWNLOAD
-Round 3: ep03.mkv = HIGH,   others = DO_NOT_DOWNLOAD
-Round 4: subs.srt = HIGH,   others = DO_NOT_DOWNLOAD
+Result (sorted fastest first):
+  [1] ep05: 1.8 MB/s
+  [2] ep02: 1.2 MB/s
+  [3] ep09: 0.9 MB/s
+  ...
+  [13] ep07: 0.01 MB/s
 
 
-Step 2: DOWNLOAD (MonoTorrent)
+Step 2: CONCURRENT DOWNLOAD (up to 6 slots)
 ─────────────────────────────────
-Peers ──► ClientEngine ──► TorrentManager ──► ./temp/ep01.mkv
-                                    │
-                              Progress events:
-                              45.2% | 2.1 MB/s | 15 peers
+Slot 1: ep05 = HIGH   ▶ downloading
+Slot 2: ep02 = HIGH   ▶ downloading
+Slot 3: ep09 = HIGH   ▶ downloading
+Slot 4: ep01 = HIGH   ▶ downloading
+Slot 5: ep11 = HIGH   ▶ downloading
+Slot 6: ep03 = HIGH   ▶ downloading
+Remaining = DO_NOT_DOWNLOAD (queued)
+
+  As file completes → Channel<CompletedFileEvent> → next file fills slot
 
 
 Step 3: UPLOAD (Google Drive API)
 ─────────────────────────────────
-./temp/ep01.mkv ──► FileStream ──► ResumableUpload ──► Google Drive
-     4 GB                   10 MB chunks
-                                    │
-                              Progress events:
-                              Chunk 47/400 | 72% | 3.5 MB/s
-
-     Result: Drive File ID = "1xAbC..."
+Completed file → ResumableUpload → 10 MB chunks → Google Drive
+  Result: Drive File ID = "1xAbC..."
 
 
 Step 4: CLEANUP
 ─────────────────────────────────
-Delete ./temp/ep01.mkv ──► 4 GB freed
-Disk usage returns to ~0
-
-──► Repeat from Step 1 with ep02.mkv
+Delete temp file → disk freed → slot available for next file
 ```
 
 ---
@@ -154,38 +157,26 @@ Disk usage returns to ~0
 // ITorrentService — manages the MonoTorrent engine
 public interface ITorrentService
 {
-    // Load a torrent and return metadata (file list, sizes)
-    Task<TorrentMetadata> LoadTorrentAsync(
-        string torrentPathOrMagnet,
-        CancellationToken ct = default);
+    Task<TorrentMetadata> LoadTorrentAsync(string torrentPathOrMagnet, CancellationToken ct);
 
-    // Download a single file from the torrent
-    // Sets this file to HIGH priority, others to DO_NOT_DOWNLOAD
-    Task<string> DownloadFileAsync(
-        int fileIndex,
-        string downloadDirectory,
-        IProgress<double>? progress = null,
-        CancellationToken ct = default);
+    // Probe all files for given duration, return indices sorted by speed (fastest first)
+    Task<int[]> ProbeFileSpeedsAsync(TimeSpan duration, CancellationToken ct);
 
-    // Cleanup engine resources
+    // Download a single file (HIGH priority, others DO_NOT_DOWNLOAD)
+    Task<string> DownloadFileAsync(int fileIndex, string downloadDirectory, ...);
+
+    // Download concurrently, yielding CompletedFileEvent via Channel as each finishes
+    ChannelReader<CompletedFileEvent> DownloadFilesConcurrentlyAsync(
+        int maxConcurrent, int[]? fileOrder = null, CancellationToken ct = default);
+
     Task StopAsync();
 }
 
 // IGoogleDriveService — manages uploads to Drive
 public interface IGoogleDriveService
 {
-    // Upload a local file to Google Drive
-    Task<string> UploadFileAsync(
-        string localFilePath,
-        string? targetFolderId = null,
-        IProgress<long>? progress = null,
-        CancellationToken ct = default);
-
-    // Create a folder on Drive (for organizing torrent contents)
-    Task<string> CreateFolderAsync(
-        string folderName,
-        string? parentFolderId = null,
-        CancellationToken ct = default);
+    Task<string> UploadFileAsync(string localFilePath, string? targetFolderId, ...);
+    Task<string> CreateFolderAsync(string folderName, string? parentFolderId, ...);
 }
 ```
 
@@ -194,26 +185,25 @@ public interface IGoogleDriveService
 ## Models
 
 ```csharp
-// Metadata about the entire torrent
-public sealed record TorrentMetadata(
-    string Name,                           // Torrent name
-    IReadOnlyList<TorrentFileInfo> Files,   // All files in torrent
-    long TotalSize);                        // Total size in bytes
+public sealed record TorrentMetadata(string Name, IReadOnlyList<TorrentFileInfo> Files, long TotalSize);
+public sealed record TorrentFileInfo(int Index, string Path, long Size, string FullPath);
+public sealed record FileProcessResult(string FileName, long FileSize, string DriveFileId,
+    TimeSpan DownloadTime, TimeSpan UploadTime);
+public sealed record CompletedFileEvent(int FileIndex, string LocalPath, TimeSpan DownloadTime);
+public sealed record DownloadRequest { ... TorrentPath, Magnet, DriveFolderId, MaxConcurrentFiles }
 
-// Info about a single file within the torrent
-public sealed record TorrentFileInfo(
-    int Index,           // File index in torrent
-    string Path,         // Relative file path
-    long Size,           // Size in bytes
-    string FullPath);    // Absolute path when downloaded
-
-// Result of processing one file
-public sealed record FileProcessResult(
-    string FileName,
-    long FileSize,
-    string DriveFileId,
-    TimeSpan DownloadTime,
-    TimeSpan UploadTime);
+// State machine for daemon mode
+public enum TorrentJobState { Added, Probing, Downloading, Paused, Done, Failed }
+public sealed class TorrentJob
+{
+    int Id;                          // Auto-incremented
+    string Name;                     // Torrent name
+    TorrentJobState State;           // Current state
+    TorrentMetadata? Metadata;
+    int[]? FileOrder;                // Speed-sorted file indices
+    List<FileProcessResult> Results; // Completed files
+    CancellationTokenSource Cts;     // Per-job cancellation
+}
 ```
 
 ---
@@ -277,7 +267,9 @@ Any unexpected exception?
     "MaxConnections": 60,
     "AllowPortForwarding": true,
     "AutoSaveLoadFastResume": true,
-    "AutoSaveLoadDhtCache": true
+    "AutoSaveLoadDhtCache": true,
+    "MaxConcurrentFiles": 6,
+    "SpeedProbeDurationSeconds": 30
   },
   "GoogleDriveSettings": {
     "ServiceAccountKeyPath": "./service-account.json",
@@ -296,6 +288,8 @@ Any unexpected exception?
 | `AllowPortForwarding` | UPnP/NAT-PMP for better connectivity | `true` |
 | `AutoSaveLoadFastResume` | Skip re-hashing on restart | `true` |
 | `AutoSaveLoadDhtCache` | Faster peer discovery on restart | `true` |
+| `MaxConcurrentFiles` | Max files downloading simultaneously | `6` |
+| `SpeedProbeDurationSeconds` | Duration of initial speed analysis | `30` |
 | `ServiceAccountKeyPath` | Google SA key file (primary, VPS) | `./service-account.json` |
 | `CredentialsPath` | Google OAuth2 client secret (fallback) | `./credentials.json` |
 | `TokenStorePath` | Cached OAuth2 refresh tokens | `./tokens` |
@@ -312,23 +306,33 @@ The app uses **System.CommandLine** for structured verb-based CLI parsing, desig
 
 ```
 TorrentProject
-├── download                  # Main workflow: download → upload → delete
+├── download                  # One-shot: probe → download → upload → delete
 │   ├── --torrent <path>      # Path to .torrent file
 │   ├── --magnet <link>       # Magnet URI
-│   └── --drive-folder <id>   # Target Google Drive folder ID
+│   ├── --drive-folder <id>   # Target Google Drive folder ID
+│   └── --concurrent <N>      # Override max concurrent files (default: 6)
+│
+├── daemon                    # Interactive mode: manage multiple torrents
+│   (stdin commands)          # add / status / progress / pause / resume / stop / quit
 │
 ├── auth                      # Authenticate with Google (needs browser)
-│                             # Run on local machine, copy tokens to VPS
 │
 └── list-files                # Inspect torrent contents (no download)
     ├── --torrent <path>
     └── --magnet <link>
 ```
 
-### NuGet Package
+### Daemon Commands
 
-```xml
-<PackageReference Include="System.CommandLine" Version="2.*" />
+```
+> add --magnet "magnet:?xt=..."     Add torrent (auto: probe → download → upload)
+> add --torrent "path/file.torrent" Add from .torrent file
+> status                            One-line summary per job
+> progress <id>                     Per-file detail for one job
+> pause <id>                        Pause a running job
+> resume <id>                       Resume a paused job
+> stop <id>                         Remove a job
+> quit                              Graceful shutdown
 ```
 
 ### Command Flow
@@ -336,19 +340,18 @@ TorrentProject
 ```
 Program.cs
     │
-    ├── Parse CLI args via System.CommandLine
+    ├── "download" verb (one-shot)
+    │   └── TorrentWorker: probe speeds → concurrent download → upload → delete
     │
-    ├── "download" verb
-    │   └── Start Host with TorrentWorker (BackgroundService)
-    │       └── Per-file loop: download → upload → delete → next
+    ├── "daemon" verb (interactive, long-running)
+    │   ├── DownloadManager: manages List<TorrentJob>
+    │   └── CommandHandler: stdin loop → dispatches to DownloadManager
     │
     ├── "auth" verb
-    │   └── Run GoogleAuthService.AuthenticateAsync()
-    │       └── Opens browser → saves token to ./tokens/
+    │   └── Opens browser → saves token to ./tokens/
     │
     └── "list-files" verb
-        └── Load torrent metadata via MonoTorrent
-            └── Print file list to console → exit
+        └── Print file list → exit
 ```
 
 ---
@@ -422,7 +425,7 @@ After=network.target
 Type=simple
 User=torrent
 WorkingDirectory=/opt/torrentproject
-ExecStart=/opt/torrentproject/TorrentProject download --torrent "/path/to/file.torrent"
+ExecStart=/opt/torrentproject/TorrentProject daemon
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
