@@ -12,6 +12,7 @@ public interface IGoogleDriveService
     Task<string> UploadFileAsync(
         string localFilePath,
         string? targetFolderId = null,
+        string? fileName = null,
         IProgress<long>? progress = null,
         CancellationToken ct = default);
 

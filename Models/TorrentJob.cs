@@ -21,7 +21,10 @@ public enum TorrentJobState
     Done,
 
     /// <summary>An error occurred during processing.</summary>
-    Failed
+    Failed,
+
+    /// <summary>Stopped by user, can be resumed or deleted.</summary>
+    Stopped
 }
 
 /// <summary>
@@ -58,8 +61,14 @@ public sealed class TorrentJob
     /// <summary>File processing results (one per completed file).</summary>
     public List<FileProcessResult> Results { get; } = [];
 
+    /// <summary>File indices that were skipped by the auto-filter (Extra folders, non-video, nested).</summary>
+    public HashSet<int> SkippedFileIndices { get; } = [];
+
     /// <summary>Total files in this torrent.</summary>
     public int TotalFiles => Metadata?.Files.Count ?? 0;
+
+    /// <summary>Number of files queued for download (excluding skipped).</summary>
+    public int ActiveFileCount => TotalFiles - SkippedFileIndices.Count;
 
     /// <summary>Number of files fully processed (downloaded + uploaded).</summary>
     public int CompletedFiles => Results.Count;

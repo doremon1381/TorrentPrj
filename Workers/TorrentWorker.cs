@@ -18,7 +18,7 @@ public sealed class TorrentWorker(
     IOptions<TorrentSettings> torrentSettings,
     IOptions<GoogleDriveSettings> driveSettings,
     DownloadRequest downloadRequest,
-    ILogger<TorrentWorker> logger,
+    ILogger<TorrentWorker> _logger,
     IHostApplicationLifetime lifetime) : BackgroundService
 {
     #region Public Methods
@@ -34,7 +34,7 @@ public sealed class TorrentWorker(
             var torrentFolderId = await CreateDriveFolderAsync(metadata, stoppingToken);
             var maxConcurrent = GetEffectiveConcurrency();
 
-            logger.LogInformation("Download mode: {Concurrent} concurrent file(s)", maxConcurrent);
+            _logger.LogInformation("Download mode: {Concurrent} concurrent file(s)", maxConcurrent);
 
             // Speed probe: analyze file speeds, then download fastest first
             var probeDuration = TimeSpan.FromSeconds(
@@ -51,11 +51,11 @@ public sealed class TorrentWorker(
         }
         catch (OperationCanceledException)
         {
-            logger.LogWarning("Operation was cancelled");
+            _logger.LogWarning("Operation was cancelled");
         }
         catch (Exception ex)
         {
-            logger.LogError(ex, "Fatal error in torrent worker");
+            _logger.LogError(ex, "Fatal error in torrent worker");
         }
         finally
         {
@@ -73,7 +73,7 @@ public sealed class TorrentWorker(
     /// </summary>
     private async Task<TorrentMetadata> LoadTorrentAsync(CancellationToken ct)
     {
-        logger.LogInformation("═══ TorrentProject – Starting ═══");
+        _logger.LogInformation("═══ TorrentProject – Starting ═══");
 
         var metadata = await torrentService.LoadTorrentAsync(
             downloadRequest.InputValue, ct);
@@ -97,7 +97,7 @@ public sealed class TorrentWorker(
         var torrentFolderId = await driveService.CreateFolderAsync(
             metadata.Name, targetFolderId, ct);
 
-        logger.LogInformation("Created Drive folder: {Name} → {Id}", metadata.Name, torrentFolderId);
+        _logger.LogInformation("Created Drive folder: {Name} → {Id}", metadata.Name, torrentFolderId);
         return torrentFolderId;
     }
 
@@ -123,7 +123,7 @@ public sealed class TorrentWorker(
             ct.ThrowIfCancellationRequested();
 
             var fileInfo = metadata.Files[completed.FileIndex];
-            logger.LogInformation(
+            _logger.LogInformation(
                 "═══ Uploading [{Index}/{Total}]: {Path} ═══",
                 completed.FileIndex + 1, metadata.Files.Count, fileInfo.Path);
 
@@ -132,7 +132,7 @@ public sealed class TorrentWorker(
 
             results.Add(result);
 
-            logger.LogInformation(
+            _logger.LogInformation(
                 "✓ Complete: {Name} | DL: {DlTime:F1}s | UL: {UlTime:F1}s | Drive: {DriveId}",
                 result.FileName, result.DownloadTime.TotalSeconds,
                 result.UploadTime.TotalSeconds, result.DriveFileId);
@@ -180,13 +180,13 @@ public sealed class TorrentWorker(
 
             var fileSize = new FileInfo(localPath).Length;
             File.Delete(localPath);
-            logger.LogInformation(
+            _logger.LogInformation(
                 "Deleted temp file: {Path} ({Size:F2} MB freed)",
                 localPath, fileSize / 1024.0 / 1024.0);
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Failed to delete temp file: {Path}", localPath);
+            _logger.LogWarning(ex, "Failed to delete temp file: {Path}", localPath);
         }
     }
 
@@ -199,21 +199,21 @@ public sealed class TorrentWorker(
     /// </summary>
     private void LogTorrentSummary(TorrentMetadata metadata)
     {
-        logger.LogInformation("Torrent: {Name}", metadata.Name);
-        logger.LogInformation("Files:   {Count}", metadata.Files.Count);
-        logger.LogInformation("Total:   {Size:F2} MB", metadata.TotalSize / 1024.0 / 1024.0);
-        logger.LogInformation("Largest: {Size:F2} MB (max disk per slot)",
+        _logger.LogInformation("Torrent: {Name}", metadata.Name);
+        _logger.LogInformation("Files:   {Count}", metadata.Files.Count);
+        _logger.LogInformation("Total:   {Size:F2} MB", metadata.TotalSize / 1024.0 / 1024.0);
+        _logger.LogInformation("Largest: {Size:F2} MB (max disk per slot)",
             metadata.Files.Max(f => f.Size) / 1024.0 / 1024.0);
-        logger.LogInformation("─────────────────────────────────────────");
+        _logger.LogInformation("─────────────────────────────────────────");
 
         foreach (var file in metadata.Files)
         {
-            logger.LogInformation(
+            _logger.LogInformation(
                 "  [{Index}] {Path} ({Size:F2} MB)",
                 file.Index, file.Path, file.Size / 1024.0 / 1024.0);
         }
 
-        logger.LogInformation("─────────────────────────────────────────");
+        _logger.LogInformation("─────────────────────────────────────────");
     }
 
     /// <summary>
@@ -221,19 +221,19 @@ public sealed class TorrentWorker(
     /// </summary>
     private void LogFinalSummary(TorrentMetadata metadata, List<FileProcessResult> results)
     {
-        logger.LogInformation("═══ TorrentProject – Complete ═══");
-        logger.LogInformation("Torrent:        {Name}", metadata.Name);
-        logger.LogInformation("Files processed: {Count}/{Total}",
+        _logger.LogInformation("═══ TorrentProject – Complete ═══");
+        _logger.LogInformation("Torrent:        {Name}", metadata.Name);
+        _logger.LogInformation("Files processed: {Count}/{Total}",
             results.Count, metadata.Files.Count);
 
         var totalDlTime = TimeSpan.FromTicks(results.Sum(r => r.DownloadTime.Ticks));
         var totalUlTime = TimeSpan.FromTicks(results.Sum(r => r.UploadTime.Ticks));
         var totalSize = results.Sum(r => r.FileSize);
 
-        logger.LogInformation("Total size:     {Size:F2} MB", totalSize / 1024.0 / 1024.0);
-        logger.LogInformation("Total download: {Time}", totalDlTime);
-        logger.LogInformation("Total upload:   {Time}", totalUlTime);
-        logger.LogInformation("Wall time:      {Time} (downloads were concurrent)",
+        _logger.LogInformation("Total size:     {Size:F2} MB", totalSize / 1024.0 / 1024.0);
+        _logger.LogInformation("Total download: {Time}", totalDlTime);
+        _logger.LogInformation("Total upload:   {Time}", totalUlTime);
+        _logger.LogInformation("Wall time:      {Time} (downloads were concurrent)",
             TimeSpan.FromTicks(Math.Max(totalDlTime.Ticks, totalUlTime.Ticks)));
     }
 

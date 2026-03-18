@@ -69,7 +69,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
 
         var metadata = BuildMetadata();
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "Torrent loaded: {Name} | {FileCount} files | {TotalSize:F2} MB",
             metadata.Name, metadata.Files.Count, metadata.TotalSize / 1024.0 / 1024.0);
 
@@ -83,7 +83,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
         EnsureLoaded();
 
         var fileCount = _manager!.Files.Count;
-        _logger.LogInformation(
+        _logger.LogDebug(
             "Speed probe: analyzing {Count} files for {Duration}s...",
             fileCount, duration.TotalSeconds);
 
@@ -113,7 +113,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
         EnsureLoaded();
 
         var targetFile = _manager!.Files[fileIndex];
-        _logger.LogInformation(
+        _logger.LogDebug(
             "Downloading file [{Index}/{Total}]: {Path} ({Size:F2} MB)",
             fileIndex + 1, _manager.Files.Count, targetFile.Path,
             targetFile.Length / 1024.0 / 1024.0);
@@ -123,7 +123,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
         await PollFileCompletionAsync(targetFile, progress, ct);
         await _manager.StopAsync();
 
-        _logger.LogInformation("Download complete: {Path}", targetFile.FullPath);
+        _logger.LogDebug("Download complete: {Path}", targetFile.FullPath);
         return targetFile.FullPath;
     }
 
@@ -155,7 +155,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
 
         if (_engine is not null)
         {
-            _logger.LogInformation("Torrent engine stopped");
+            _logger.LogDebug("Torrent engine stopped");
         }
     }
 
@@ -204,12 +204,12 @@ public sealed class TorrentService : ITorrentService, IDisposable
 
         if (MagnetLink.TryParse(torrentPathOrMagnet, out var magnetLink))
         {
-            _logger.LogInformation("Loading magnet link: {Magnet}",
+            _logger.LogDebug("Loading magnet link: {Magnet}",
                 torrentPathOrMagnet[..Math.Min(80, torrentPathOrMagnet.Length)]);
             return await _engine!.AddAsync(magnetLink, downloadDir, torrentSettings.ToSettings());
         }
 
-        _logger.LogInformation("Loading torrent file: {Path}", torrentPathOrMagnet);
+        _logger.LogDebug("Loading torrent file: {Path}", torrentPathOrMagnet);
         return await _engine!.AddAsync(torrentPathOrMagnet, downloadDir, torrentSettings.ToSettings());
     }
 
@@ -219,7 +219,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
     private void AttachManagerEventHandlers()
     {
         _manager!.TorrentStateChanged += (_, e) =>
-            _logger.LogInformation("Torrent state: {Old} → {New}", e.OldState, e.NewState);
+            _logger.LogDebug("Torrent state: {Old} → {New}", e.OldState, e.NewState);
 
         _manager.PeersFound += (_, e) =>
             _logger.LogDebug("{Type}: {NewPeers} new peers", e.GetType().Name, e.NewPeers);
@@ -230,11 +230,11 @@ public sealed class TorrentService : ITorrentService, IDisposable
     /// </summary>
     private async Task WaitForMagnetMetadataAsync(CancellationToken ct)
     {
-        _logger.LogInformation("Waiting for magnet metadata...");
+        _logger.LogDebug("Waiting for magnet metadata...");
         await _manager!.StartAsync();
         await _manager.WaitForMetadataAsync(ct);
         await _manager.StopAsync();
-        _logger.LogInformation("Metadata received: {Name}", _manager.Torrent!.Name);
+        _logger.LogDebug("Metadata received: {Name}", _manager.Torrent!.Name);
     }
 
     /// <summary>
@@ -287,7 +287,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
             var speed = bytesReceived / duration.TotalSeconds;
             speeds.Add((i, speed));
 
-            _logger.LogInformation(
+            _logger.LogDebug(
                 "  [{Index}] {Name}: {Speed:F2} KB/s",
                 i + 1, Path.GetFileName(_manager.Files[i].Path), speed / 1024.0);
         }
@@ -297,7 +297,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
             .Select(s => s.Index)
             .ToArray();
 
-        _logger.LogInformation("Speed probe complete. Download order: {Order}",
+        _logger.LogDebug("Speed probe complete. Download order: {Order}",
             string.Join(", ", sorted.Select(i => $"[{i + 1}]")));
 
         return sorted;
@@ -351,7 +351,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
             var downSpeed = _engine!.TotalDownloadRate / 1024.0;
             var peers = await _manager!.GetPeersAsync();
 
-            _logger.LogInformation(
+            _logger.LogDebug(
                 "  Progress: {Progress:F1}% | Speed: {Speed:F1} KB/s | Peers: {Peers}",
                 targetFile.BitField.PercentComplete, downSpeed, peers.Count);
 
@@ -379,7 +379,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
             var effectiveConcurrent = Math.Min(maxConcurrent, fileCount);
             var orderedIndices = fileOrder ?? Enumerable.Range(0, fileCount).ToArray();
 
-            _logger.LogInformation(
+            _logger.LogDebug(
                 "Starting concurrent download: {Concurrent} slots for {Total} files",
                 effectiveConcurrent, fileCount);
 
@@ -473,7 +473,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
         var file = _manager!.Files[fileIndex];
         await _manager.SetFilePriorityAsync(file, Priority.DoNotDownload);
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "✓ Download complete [{Index}/{Total}]: {Path} in {Time:F1}s",
             fileIndex + 1, totalFiles, file.Path, sw.Elapsed.TotalSeconds);
 
@@ -494,7 +494,7 @@ public sealed class TorrentService : ITorrentService, IDisposable
         _manager.SetFilePriorityAsync(file, Priority.High).GetAwaiter().GetResult();
         activeFiles[fileIndex] = Stopwatch.StartNew();
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "→ Queued for download [{Index}/{Total}]: {Path} ({Size:F2} MB)",
             fileIndex + 1, _manager.Files.Count, file.Path,
             file.Length / 1024.0 / 1024.0);
@@ -511,12 +511,12 @@ public sealed class TorrentService : ITorrentService, IDisposable
         foreach (var (idx, _) in activeFiles)
         {
             var file = _manager.Files[idx];
-            _logger.LogInformation(
+            _logger.LogDebug(
                 "  [{Index}] {Name}: {Progress:F1}%",
                 idx + 1, Path.GetFileName(file.Path), file.BitField.PercentComplete);
         }
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "  ↓ {Speed:F2} MB/s | Peers: {Peers} | Active: {Active}",
             downSpeed, peers.Count, activeFiles.Count);
     }

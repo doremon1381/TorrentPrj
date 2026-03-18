@@ -27,6 +27,8 @@ public sealed class CommandHandler(
             var line = await ReadLineAsync(stoppingToken);
 
             if (line is null) break;
+
+            // Empty line dismisses live status if active, otherwise ignore
             if (string.IsNullOrWhiteSpace(line)) continue;
 
             await HandleCommandAsync(line.Trim(), stoppingToken);
@@ -51,7 +53,7 @@ public sealed class CommandHandler(
                 HandleAdd(parts);
                 break;
             case "status" or "s":
-                HandleStatus();
+                await HandleStatusLiveAsync(ct);
                 break;
             case "progress" or "p":
                 HandleProgress(parts);
@@ -64,6 +66,12 @@ public sealed class CommandHandler(
                 break;
             case "stop":
                 HandleStop(parts);
+                break;
+            case "delete" or "del":
+                HandleDelete(parts);
+                break;
+            case "download-file" or "df":
+                HandleDownloadFile(parts);
                 break;
             case "quit" or "q" or "exit":
                 await HandleQuitAsync();
@@ -114,36 +122,75 @@ public sealed class CommandHandler(
     }
 
     /// <summary>
-    /// Handle 'status' command: show one-line summary per job.
+    /// Handle 'status' command: live-updating display, stops when user presses Enter.
     /// </summary>
-    private void HandleStatus()
+    private async Task HandleStatusLiveAsync(CancellationToken ct)
     {
         var jobs = downloadManager.GetAllJobs();
 
         if (jobs.Count == 0)
         {
-            Console.WriteLine("No active jobs. Use 'add --magnet \"...\"' to start one.");
+            Console.WriteLine("No jobs. Use 'add --magnet \"...\"' to start one.");
             return;
         }
 
-        Console.WriteLine("─────────────────────────────────────────────────────");
+        Console.WriteLine("Live status (press Enter to stop):");
+        Console.WriteLine();
+
+        // Start a background task that waits for Enter
+        var enterPressed = new TaskCompletionSource<bool>();
+        _ = Task.Run(() =>
+        {
+            Console.ReadLine();
+            enterPressed.TrySetResult(true);
+        }, ct);
+
+        while (!ct.IsCancellationRequested && !enterPressed.Task.IsCompleted)
+        {
+            RenderStatusTable();
+
+            // Wait 2 seconds or until Enter is pressed
+            var delay = Task.Delay(2000, ct);
+            await Task.WhenAny(delay, enterPressed.Task);
+        }
+
+        // Clear the live display line and return to prompt
+        Console.WriteLine("[Status display stopped]");
+    }
+
+    /// <summary>
+    /// Render the status table once (used by live status loop).
+    /// </summary>
+    private void RenderStatusTable()
+    {
+        var jobs = downloadManager.GetAllJobs();
+
+        Console.WriteLine("\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
         foreach (var job in jobs)
         {
-            var stateIcon = job.State switch
-            {
-                TorrentJobState.Probing => "🔍",
-                TorrentJobState.Downloading => "⬇️",
-                TorrentJobState.Paused => "⏸️",
-                TorrentJobState.Done => "✅",
-                TorrentJobState.Failed => "❌",
-                _ => "⏳"
-            };
-
+            var stateIcon = GetStateIcon(job.State);
+            var fileDisplay = job.SkippedFileIndices.Count > 0
+                ? $"{job.CompletedFiles}/{job.ActiveFileCount} files ({job.SkippedFileIndices.Count} skipped)"
+                : $"{job.CompletedFiles}/{job.TotalFiles} files";
             Console.WriteLine(
-                $"  [{job.Id}] {stateIcon} {job.Name} | {job.State} | {job.CompletedFiles}/{job.TotalFiles} files");
+                $"  [{job.Id}] {stateIcon} {job.Name} | {job.State} | {fileDisplay}");
         }
-        Console.WriteLine("─────────────────────────────────────────────────────");
+        Console.WriteLine("\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
     }
+
+    /// <summary>
+    /// Get icon for job state.
+    /// </summary>
+    private static string GetStateIcon(TorrentJobState state) => state switch
+    {
+        TorrentJobState.Probing => "\ud83d\udd0d",
+        TorrentJobState.Downloading => "\u2b07\ufe0f",
+        TorrentJobState.Paused => "\u23f8\ufe0f",
+        TorrentJobState.Stopped => "\u23f9\ufe0f",
+        TorrentJobState.Done => "\u2705",
+        TorrentJobState.Failed => "\u274c",
+        _ => "\u23f3"
+    };
 
     /// <summary>
     /// Handle 'progress' command: show per-file detail for one job.
@@ -175,9 +222,22 @@ public sealed class CommandHandler(
 
         foreach (var file in job.Metadata.Files)
         {
-            var status = completedPaths.Contains(file.Path) ? "✓ uploaded" : "  queued";
+            string status;
+            if (completedPaths.Contains(file.Path))
+                status = "✓ uploaded";
+            else if (job.SkippedFileIndices.Contains(file.Index))
+                status = "⬇ skipped";
+            else
+                status = "  queued";
+
             Console.WriteLine(
-                $"  [{file.Index + 1}] {status} | {file.Path} ({file.Size / 1024.0 / 1024.0:F1} MB)");
+                $"  [{file.Index}] {status} | {file.Path} ({file.Size / 1024.0 / 1024.0:F1} MB)");
+        }
+
+        if (job.SkippedFileIndices.Count > 0)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"  {job.SkippedFileIndices.Count} files skipped. Use 'download-file {job.Id} <index>' to queue them.");
         }
 
         if (job.Results.Count > 0)
@@ -218,7 +278,7 @@ public sealed class CommandHandler(
 
         Console.WriteLine(downloadManager.Resume(jobId)
             ? $"[{jobId}] Resumed"
-            : $"[{jobId}] Cannot resume (not paused or not found)");
+            : $"[{jobId}] Cannot resume (not paused/stopped or not found)");
     }
 
     /// <summary>
@@ -233,8 +293,63 @@ public sealed class CommandHandler(
         }
 
         Console.WriteLine(downloadManager.Stop(jobId)
-            ? $"[{jobId}] Stopped and removed"
-            : $"[{jobId}] Not found");
+            ? $"[{jobId}] Stopped (use 'resume {jobId}' to restart, 'delete {jobId}' to remove)"
+            : $"[{jobId}] Cannot stop (already stopped/done or not found)");
+    }
+
+    /// <summary>
+    /// Handle 'delete' command: remove stopped/done/failed jobs.
+    /// </summary>
+    private void HandleDelete(string[] parts)
+    {
+        if (parts.Length < 2 || !int.TryParse(parts[1], out var jobId))
+        {
+            Console.WriteLine("Usage: delete <job-id>");
+            return;
+        }
+
+        Console.WriteLine(downloadManager.Delete(jobId)
+            ? $"[{jobId}] Deleted"
+            : $"[{jobId}] Cannot delete (still running, or not found)");
+    }
+
+    /// <summary>
+    /// Handle 'download-file' command: queue skipped files for download.
+    /// Usage: download-file <job-id> <file-index> [<file-index> ...]
+    /// </summary>
+    private void HandleDownloadFile(string[] parts)
+    {
+        if (parts.Length < 3)
+        {
+            Console.WriteLine("Usage: download-file <job-id> <file-index> [<file-index> ...]");
+            Console.WriteLine("  Use 'progress <job-id>' to see file indices.");
+            return;
+        }
+
+        if (!int.TryParse(parts[1], out var jobId))
+        {
+            Console.WriteLine("Invalid job ID.");
+            return;
+        }
+
+        var fileIndices = new List<int>();
+        for (var i = 2; i < parts.Length; i++)
+        {
+            if (int.TryParse(parts[i], out var idx))
+                fileIndices.Add(idx);
+            else
+                Console.WriteLine($"Skipping invalid index: {parts[i]}");
+        }
+
+        if (fileIndices.Count == 0)
+        {
+            Console.WriteLine("No valid file indices provided.");
+            return;
+        }
+
+        Console.WriteLine(downloadManager.QueueFiles(jobId, fileIndices.ToArray())
+            ? $"[{jobId}] Queued {fileIndices.Count} file(s) for download"
+            : $"[{jobId}] Cannot queue files (job must be stopped/done/failed, or not found)");
     }
 
     /// <summary>
@@ -273,11 +388,13 @@ public sealed class CommandHandler(
         Console.WriteLine("Commands:");
         Console.WriteLine("  add --magnet \"...\"    Add a torrent by magnet link");
         Console.WriteLine("  add --torrent \"...\"   Add a torrent by .torrent file");
-        Console.WriteLine("  status (s)            Show all jobs");
+        Console.WriteLine("  status (s)            Live status (press Enter to stop)");
         Console.WriteLine("  progress <id> (p)     Show per-file detail for a job");
         Console.WriteLine("  pause <id>            Pause a running job");
-        Console.WriteLine("  resume <id>           Resume a paused job");
-        Console.WriteLine("  stop <id>             Stop and remove a job");
+        Console.WriteLine("  resume <id>           Resume a paused/stopped job");
+        Console.WriteLine("  stop <id>             Stop a job (keeps it for resume)");
+        Console.WriteLine("  delete <id> (del)     Delete a stopped/done/failed job");
+        Console.WriteLine("  download-file (df)    Queue skipped files: df <job-id> <file-idx> ...");
         Console.WriteLine("  quit (q)              Shut down all jobs and exit");
         Console.WriteLine("  help (h)              Show this help");
         Console.WriteLine();

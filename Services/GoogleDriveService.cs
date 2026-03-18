@@ -50,41 +50,49 @@ public sealed class GoogleDriveService : IGoogleDriveService
     public async Task<string> UploadFileAsync(
         string localFilePath,
         string? targetFolderId = null,
+        string? fileName = null,
         IProgress<long>? progress = null,
         CancellationToken ct = default)
     {
         var driveService = await GetDriveServiceAsync(ct);
-        var fileName = Path.GetFileName(localFilePath);
+        fileName ??= Path.GetFileName(localFilePath);
         var fileSize = new FileInfo(localFilePath).Length;
         var folderId = targetFolderId ?? _settings.TargetFolderId;
 
-        _logger.LogInformation(
+        _logger.LogDebug(
             "Uploading: {FileName} ({Size:F2} MB) → Drive folder {FolderId}",
             fileName, fileSize / 1024.0 / 1024.0,
             string.IsNullOrEmpty(folderId) ? "(root)" : folderId);
 
-        var request = await CreateUploadRequestAsync(
+        var (request, stream) = await CreateUploadRequestAsync(
             driveService, localFilePath, fileName, folderId);
 
-        AttachProgressHandler(request, fileSize, progress);
-
-        var result = await request.UploadAsync(ct);
-
-        if (result.Status == UploadStatus.Failed)
+        try
         {
-            throw new InvalidOperationException(
-                $"Upload failed for '{fileName}': {result.Exception?.Message}",
-                result.Exception);
+            AttachProgressHandler(request, fileSize, progress);
+
+            var result = await request.UploadAsync(ct);
+
+            if (result.Status == UploadStatus.Failed)
+            {
+                throw new InvalidOperationException(
+                    $"Upload failed for '{fileName}': {result.Exception?.Message}",
+                    result.Exception);
+            }
+
+            var driveFileId = request.ResponseBody.Id;
+            var webLink = request.ResponseBody.WebViewLink;
+
+            _logger.LogDebug(
+                "Upload complete: {FileName} → Drive ID: {DriveId} | Link: {Link}",
+                fileName, driveFileId, webLink ?? "N/A");
+
+            return driveFileId;
         }
-
-        var driveFileId = request.ResponseBody.Id;
-        var webLink = request.ResponseBody.WebViewLink;
-
-        _logger.LogInformation(
-            "Upload complete: {FileName} → Drive ID: {DriveId} | Link: {Link}",
-            fileName, driveFileId, webLink ?? "N/A");
-
-        return driveFileId;
+        finally
+        {
+            await stream.DisposeAsync();
+        }
     }
 
     /// <inheritdoc />
@@ -128,7 +136,7 @@ public sealed class GoogleDriveService : IGoogleDriveService
     /// <summary>
     /// Create a resumable upload request for a local file.
     /// </summary>
-    private async Task<FilesResource.CreateMediaUpload> CreateUploadRequestAsync(
+    private Task<(FilesResource.CreateMediaUpload Request, FileStream Stream)> CreateUploadRequestAsync(
         DriveService driveService, string localFilePath, string fileName, string? folderId)
     {
         var fileMetadata = new Google.Apis.Drive.v3.Data.File
@@ -137,14 +145,14 @@ public sealed class GoogleDriveService : IGoogleDriveService
             Parents = !string.IsNullOrEmpty(folderId) ? [folderId] : null
         };
 
-        var stream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read);
+        var stream = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         var mimeType = GetMimeType(localFilePath);
 
         var request = driveService.Files.Create(fileMetadata, stream, mimeType);
         request.Fields = "id, name, size, webViewLink";
         request.ChunkSize = _settings.ChunkSizeMB * 1024 * 1024;
 
-        return request;
+        return Task.FromResult((request, stream));
     }
 
     /// <summary>
@@ -164,7 +172,7 @@ public sealed class GoogleDriveService : IGoogleDriveService
             if (percent / LogIntervalPercent > lastLoggedPercent / LogIntervalPercent)
             {
                 lastLoggedPercent = percent;
-                _logger.LogInformation(
+                _logger.LogDebug(
                     "  Upload: {Percent}% | {Sent:F1} / {Total:F1} MB",
                     percent, p.BytesSent / 1024.0 / 1024.0, fileSize / 1024.0 / 1024.0);
             }
